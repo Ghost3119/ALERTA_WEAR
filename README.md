@@ -15,7 +15,7 @@ Proyecto académico para la materia **Desarrollo de Dispositivos Inteligentes**.
 - **Botón SOS con pulsación prolongada:** Evita activaciones accidentales exigiendo mantener presionado el botón central para iniciar la alerta.
 - **Cuenta regresiva cancelable (5 segundos):** Permite abortar el aviso en cualquier momento antes de transmitir la solicitud al teléfono.
 - **Transmisión y reintento sin duplicados:** Envía la solicitud SOS (`MessageClient`) con un identificador único (`requestId`). Si no hay conexión al terminar la cuenta regresiva, muestra la pantalla **Sin conexión** y permite reintentar conservando el mismo `requestId`.
-- **Seguimiento de estado en tiempo real:** Recibe confirmaciones (*ACK*) desde el teléfono para reflejar cada etapa (*Solicitud recibida*, *Enviando SMS con/sin ubicación*, *SMS enviado por el dispositivo*, *SMS entregado* o errores específicos).
+- **Seguimiento de estado en tiempo real y límite de espera (*timeout*):** Recibe confirmaciones (*ACK*) desde el teléfono para reflejar cada etapa (*Solicitud recibida*, *Enviando SMS con/sin ubicación*, *SMS enviado por el dispositivo*, *SMS entregado* o errores específicos). Si el teléfono no responde o se pierde la confirmación, tras un tiempo límite el reloj muestra **Sin confirmación ("No se pudo confirmar el resultado")** sin afirmar que el SMS se envió ni que falló.
 
 ### Aplicación móvil Android (`:app`)
 - **Gestión local del contacto de confianza:** Permite guardar y actualizar nombre y número telefónico en almacenamiento local (`SharedPreferences`).
@@ -202,13 +202,17 @@ adb -s <SERIAL_TELEFONO> shell am instrument -w -e class com.example.alertawear.
 
 ## 11. Limitaciones conocidas
 
-1. **Ejecución en segundo plano y pantalla apagada (Android 8+ / 12+ / 14+):**
-   - Cuando el reloj envía un SOS, `PhoneWearableListenerService` despierta brevemente el proceso de la app en el teléfono.
-   - Si el usuario solo otorgó el permiso de ubicación *"Mientras la app está en uso"* (`ACCESS_FINE_LOCATION` sin `ACCESS_BACKGROUND_LOCATION`) y la app móvil está en segundo plano o con la pantalla apagada, Android restringe el acceso al GPS. En ese caso, la aplicación **envía el SMS de prueba sin coordenadas**, indicando en el texto que la ubicación no estuvo disponible en segundo plano, y muestra una notificación de alta prioridad.
-   - Un `CoroutineScope` en memoria no impide por sí mismo que el sistema operativo suspenda o cierre el proceso en segundo plano tras desvincular el `WearableListenerService` bajo condiciones de ahorro de batería (*Doze*) o poca memoria. Para garantizar ejecución continua en segundo plano se requeriría un *Foreground Service* con tipo `location` y permiso `ACCESS_BACKGROUND_LOCATION`.
-2. **Confirmación de entrega (`DELIVERED`):**
+1. **Ejecución en segundo plano y pantalla bloqueada o apagada (Android 8+ / 12+ / 14+):**
+   - Cuando el reloj envía un SOS, `PhoneWearableListenerService` es vinculado temporalmente por Google Play Services y procesa la solicitud en su hilo de trabajo antes de retornar (`runBlocking` con límite de 14 segundos) para evitar que el servicio se desvincule prematuramente.
+   - **Límite de ubicación en segundo plano:** Si el usuario solo otorgó el permiso de ubicación *"Mientras la app está en uso"* (`ACCESS_FINE_LOCATION` sin `ACCESS_BACKGROUND_LOCATION`) y la app móvil está en segundo plano o con la pantalla apagada/bloqueada, Android bloquea la lectura del GPS. En ese caso, la aplicación **envía el SMS de prueba sin coordenadas**, indicando en el texto que la ubicación no estuvo disponible en segundo plano, y muestra una notificación de alta prioridad.
+   - **Por qué no se agregan `ACCESS_BACKGROUND_LOCATION` ni servicios persistentes por defecto, y por qué tampoco garantizan ejecución:**
+     - Solicitar ubicación en segundo plano (`ACCESS_BACKGROUND_LOCATION`) o mantener un *Foreground Service* permanente conlleva restricciones estrictas del sistema operativo y de políticas de plataforma, además de mayor consumo de batería.
+     - Más importante aún: **ni siquiera un *Foreground Service* ni `ACCESS_BACKGROUND_LOCATION` garantizan ejecución continua al 100 % en Android moderno**. A partir de Android 12/14+, el sistema restringe el inicio de *Foreground Services* desde segundo plano, el modo *Doze* con pantalla apagada retrasa entregas de red/sensores, las capas de ahorro de batería de distintos fabricantes (OEM) pueden terminar procesos en segundo plano y, si el usuario fuerza el cierre (*Force Stop*) de la aplicación, ningún servicio o receptor se ejecutará hasta que la aplicación vuelva a abrirse manualmente.
+2. **Pérdida de confirmación hacia el reloj (*ACK Timeout*):**
+   - Si el reloj envía la solicitud SOS pero el teléfono no devuelve confirmación (por desconexión Bluetooth posterior al envío o interrupción del proceso en segundo plano), el reloj deja de mostrar *"Preparando"* tras 12 segundos y pasa a **Sin confirmación (*"No se pudo confirmar el resultado"*)**, indicando revisar el teléfono sin afirmar que el SMS se envió ni que falló.
+3. **Confirmación de entrega (`DELIVERED`):**
    - El broadcast `ACTION_SMS_DELIVERED` depende del soporte de reportes de entrega (*Delivery Reports*) de cada operadora telefónica. En redes que no notifican entrega al dispositivo origen, el estado permanecerá en **Enviado por el dispositivo (entrega sin confirmar)**.
-3. **Teléfono sin señal, modo avión o sin tarjeta SIM:**
+4. **Teléfono sin señal, modo avión o sin tarjeta SIM:**
    - Si el teléfono no tiene servicio celular o está en modo avión, el envío falla con estado **Error** y no se encola para reintento automático posterior cuando regrese la señal; el usuario debe iniciar o reintentar el aviso.
-4. **Alcance de conexión del reloj:**
+5. **Alcance de conexión del reloj:**
    - La comunicación entre el reloj y el teléfono depende del enlace activo de **Wear OS Data Layer** (Bluetooth / red local emparejada). Si el reloj pierde conexión con el teléfono, no puede enviar el SMS por cuenta propia y muestra la pantalla **Sin conexión**.

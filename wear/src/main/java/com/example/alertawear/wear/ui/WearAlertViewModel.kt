@@ -21,9 +21,10 @@ enum class WearScreen {
 }
 
 /**
- * Estado del reloj Wear OS en la Fase 2.
+ * Estado del reloj Wear OS.
  * Refleja únicamente la conexión real detectada por Wear OS Data Layer (`NodeClient`) y las
- * confirmaciones reales recibidas desde el teléfono (`MessageClient`).
+ * confirmaciones reales recibidas desde el teléfono (`MessageClient`), incluyendo un tiempo límite
+ * para informar honestamente si no se pudo confirmar el resultado sin afirmar éxito ni fallo del SMS.
  */
 data class WearUiState(
     val currentScreen: WearScreen = WearScreen.HOME,
@@ -48,13 +49,15 @@ data class WearUiState(
 
 class WearAlertViewModel(
     private val bridge: WearPhoneBridge,
-    private val countdownTickMs: Long = 1000L
+    private val countdownTickMs: Long = 1000L,
+    private val ackTimeoutMs: Long = 12_000L
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(WearUiState())
     val uiState: StateFlow<WearUiState> = _uiState.asStateFlow()
 
     private var countdownJob: Job? = null
+    private var ackTimeoutJob: Job? = null
 
     init {
         refreshConnectionStatus()
@@ -84,6 +87,8 @@ class WearAlertViewModel(
 
     fun onSosLongPressed() {
         countdownJob?.cancel()
+        ackTimeoutJob?.cancel()
+        bridge.clearLastAck()
         val newRequestId = "sos_${System.currentTimeMillis()}"
         _uiState.update {
             it.copy(
@@ -104,6 +109,9 @@ class WearAlertViewModel(
     fun cancelCountdown() {
         countdownJob?.cancel()
         countdownJob = null
+        ackTimeoutJob?.cancel()
+        ackTimeoutJob = null
+        bridge.clearLastAck()
         _uiState.update {
             it.copy(
                 currentScreen = WearScreen.HOME,
@@ -116,7 +124,7 @@ class WearAlertViewModel(
 
     /**
      * Envía la solicitud SOS real al teléfono al finalizar la cuenta regresiva o al pulsar Reintentar.
-     * Si es un reintento, conserva el mismo `activeRequestId` para evitar registros duplicados en el teléfono.
+     * Si es un reintento, conserva el mismo `activeRequestId` para evitar registros o SMS duplicados en el teléfono.
      */
     private suspend fun transmitSosRequest(requestId: String) {
         val connection = bridge.checkPhoneConnection()
@@ -129,6 +137,7 @@ class WearAlertViewModel(
         }
 
         if (!connection.isConnected) {
+            ackTimeoutJob?.cancel()
             _uiState.update {
                 it.copy(
                     currentScreen = WearScreen.NO_CONNECTION,
@@ -150,6 +159,7 @@ class WearAlertViewModel(
 
         val sent = bridge.sendSosRequest(requestId)
         if (!sent) {
+            ackTimeoutJob?.cancel()
             _uiState.update {
                 it.copy(
                     currentScreen = WearScreen.NO_CONNECTION,
@@ -158,12 +168,36 @@ class WearAlertViewModel(
                 )
             }
         } else {
-            // Mientras llega el ACK del teléfono
+            // Mientras llega el ACK del teléfono, iniciar temporizador de falta de confirmación
             _uiState.update {
                 if (it.statusDetailMessage == "Enviando solicitud...") {
                     it.copy(statusDetailMessage = "Esperando confirmación...")
                 } else {
                     it
+                }
+            }
+            startAckTimeout(requestId)
+        }
+    }
+
+    /**
+     * Evita que el reloj se quede indefinidamente en "Preparando" o "Esperando confirmación" si la
+     * respuesta del teléfono se pierde o el proceso en segundo plano es interrumpido.
+     * Informa que no se pudo confirmar el resultado sin afirmar que el SMS falló ni que se envió.
+     */
+    private fun startAckTimeout(requestId: String) {
+        ackTimeoutJob?.cancel()
+        ackTimeoutJob = viewModelScope.launch {
+            delay(ackTimeoutMs)
+            val current = _uiState.value
+            if (current.activeRequestId == requestId && current.currentScreen == WearScreen.IN_PROGRESS) {
+                _uiState.update {
+                    it.copy(
+                        inProgressTitle = "Sin confirmación",
+                        inProgressSubtitle = "Revisa tu teléfono",
+                        statusDetailMessage = "No se pudo confirmar el resultado",
+                        footerMessage = "Toca para volver"
+                    )
                 }
             }
         }
@@ -179,6 +213,8 @@ class WearAlertViewModel(
 
     fun returnToHome() {
         countdownJob?.cancel()
+        ackTimeoutJob?.cancel()
+        bridge.clearLastAck()
         _uiState.update {
             it.copy(
                 currentScreen = WearScreen.HOME,
@@ -189,8 +225,8 @@ class WearAlertViewModel(
     }
 
     private fun onAckReceived(ack: PhoneAckPayload) {
-        val currentReqId = _uiState.value.activeRequestId
-        if (currentReqId != null && ack.requestId.isNotBlank() && ack.requestId != currentReqId) {
+        val currentReqId = _uiState.value.activeRequestId ?: return
+        if (ack.requestId != currentReqId) {
             return
         }
 
@@ -205,6 +241,7 @@ class WearAlertViewModel(
                         footerMessage = "No cierres la app"
                     )
                 }
+                startAckTimeout(currentReqId)
             }
 
             "SENDING_SMS_WITH_LOCATION",
@@ -218,6 +255,7 @@ class WearAlertViewModel(
                         footerMessage = "Espera confirmación"
                     )
                 }
+                startAckTimeout(currentReqId)
             }
 
             "SENDING_SMS_NO_LOCATION",
@@ -233,9 +271,11 @@ class WearAlertViewModel(
                         footerMessage = "Espera confirmación"
                     )
                 }
+                startAckTimeout(currentReqId)
             }
 
             "SMS_SENT_BY_DEVICE" -> {
+                ackTimeoutJob?.cancel()
                 _uiState.update {
                     it.copy(
                         currentScreen = WearScreen.IN_PROGRESS,
@@ -248,6 +288,7 @@ class WearAlertViewModel(
             }
 
             "SMS_DELIVERED" -> {
+                ackTimeoutJob?.cancel()
                 _uiState.update {
                     it.copy(
                         currentScreen = WearScreen.IN_PROGRESS,
@@ -259,7 +300,21 @@ class WearAlertViewModel(
                 }
             }
 
+            "ALERT_CANCELLED" -> {
+                ackTimeoutJob?.cancel()
+                _uiState.update {
+                    it.copy(
+                        currentScreen = WearScreen.IN_PROGRESS,
+                        inProgressTitle = "Alerta cancelada",
+                        inProgressSubtitle = "Detenida en el celular",
+                        statusDetailMessage = "No se envió SMS",
+                        footerMessage = "Toca para volver"
+                    )
+                }
+            }
+
             "ERROR_NO_CONTACT" -> {
+                ackTimeoutJob?.cancel()
                 _uiState.update {
                     it.copy(
                         currentScreen = WearScreen.IN_PROGRESS,
@@ -272,6 +327,7 @@ class WearAlertViewModel(
             }
 
             "ERROR_NO_SMS_PERM" -> {
+                ackTimeoutJob?.cancel()
                 _uiState.update {
                     it.copy(
                         currentScreen = WearScreen.IN_PROGRESS,
@@ -284,6 +340,7 @@ class WearAlertViewModel(
             }
 
             "ERROR_SMS_FAILED" -> {
+                ackTimeoutJob?.cancel()
                 _uiState.update {
                     it.copy(
                         currentScreen = WearScreen.IN_PROGRESS,

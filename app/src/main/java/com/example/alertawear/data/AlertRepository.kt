@@ -28,7 +28,8 @@ interface AlertPreparationGateway {
         sourceNodeId: String?,
         contact: TrustedContact?,
         origin: AlertOrigin,
-        isAppInForeground: Boolean
+        isAppInForeground: Boolean,
+        isCancelledCheck: () -> Boolean = { false }
     ): AlertPreparationResult
 }
 
@@ -50,9 +51,20 @@ class RealLocationAlertGateway(
         sourceNodeId: String?,
         contact: TrustedContact?,
         origin: AlertOrigin,
-        isAppInForeground: Boolean
+        isAppInForeground: Boolean,
+        isCancelledCheck: () -> Boolean
     ): AlertPreparationResult {
         val locationResult = locationProvider.obtainLocation(isAppInForeground = isAppInForeground)
+
+        if (isCancelledCheck()) {
+            return AlertPreparationResult(
+                status = AlertStatus.CANCELLED,
+                locationResult = locationResult,
+                locationSummary = "Cancelada durante la preparación",
+                smsStatusSummary = "Alerta cancelada antes de enviar SMS.",
+                watchAckStatus = ACK_CANCELLED
+            )
+        }
 
         if (contact == null || !contact.isValid) {
             return AlertPreparationResult(
@@ -114,6 +126,7 @@ class RealLocationAlertGateway(
         const val ACK_SENDING_SMS_NO_LOCATION = "SENDING_SMS_NO_LOCATION"
         const val ACK_SMS_SENT_BY_DEVICE = "SMS_SENT_BY_DEVICE"
         const val ACK_SMS_DELIVERED = "SMS_DELIVERED"
+        const val ACK_CANCELLED = "ALERT_CANCELLED"
         const val ACK_ERROR_NO_CONTACT = "ERROR_NO_CONTACT"
         const val ACK_ERROR_NO_SMS_PERM = "ERROR_NO_SMS_PERM"
         const val ACK_ERROR_SMS_FAILED = "ERROR_SMS_FAILED"
@@ -153,12 +166,13 @@ class SharedPrefsAlertStorage(
         )
     }
 
+    @Synchronized
     override fun saveContact(contact: TrustedContact) {
         prefs.edit()
             .putString(KEY_CONTACT_NAME, contact.name.trim())
             .putString(KEY_CONTACT_PHONE, contact.phone.trim())
             .putBoolean(KEY_CONTACT_SIMULATED, contact.isSimulatedSample)
-            .apply()
+            .commit()
     }
 
     override fun loadHistory(): List<AlertHistoryEvent> {
@@ -219,7 +233,7 @@ class SharedPrefsAlertStorage(
             }
             array.put(obj)
         }
-        prefs.edit().putString(KEY_HISTORY_JSON, array.toString()).apply()
+        prefs.edit().putString(KEY_HISTORY_JSON, array.toString()).commit()
     }
 
     @Synchronized

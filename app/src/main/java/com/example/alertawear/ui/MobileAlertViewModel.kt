@@ -233,12 +233,15 @@ class MobileAlertViewModel(
         countdownJob?.cancel()
         preparationJob?.cancel()
 
-        // Evitar duplicados si este requestId ya envió o está enviando SMS
+        // Evitar duplicados si este requestId ya está en preparación, enviando, enviado o cancelado
         val existing = storage.findEventByRequestId(requestId)
         if (existing != null && existing.status in listOf(
+                AlertStatus.RECEIVED,
+                AlertStatus.PREPARING_LOCATION,
                 AlertStatus.SENDING_SMS,
                 AlertStatus.SENT_BY_DEVICE,
-                AlertStatus.DELIVERED
+                AlertStatus.DELIVERED,
+                AlertStatus.CANCELLED
             )
         ) {
             _uiState.update {
@@ -285,47 +288,53 @@ class MobileAlertViewModel(
                 sourceNodeId = null,
                 contact = contact,
                 origin = origin,
-                isAppInForeground = true
+                isAppInForeground = true,
+                isCancelledCheck = {
+                    storage.findEventByRequestId(requestId)?.status == AlertStatus.CANCELLED
+                }
             )
 
-            // Respetar si SmsStatusBroadcastReceiver ya actualizó a SENT_BY_DEVICE o DELIVERED
+            // Respetar si SmsStatusBroadcastReceiver o una cancelación ya actualizaron el estado
             val latest = storage.findEventByRequestId(requestId)
-            val effectiveStatus = if (latest != null && latest.status in listOf(
-                    AlertStatus.SENT_BY_DEVICE,
-                    AlertStatus.DELIVERED
-                )
-            ) {
-                latest.status
+            val hasUpdatedTerminalState = latest != null && latest.status in listOf(
+                AlertStatus.SENT_BY_DEVICE,
+                AlertStatus.DELIVERED,
+                AlertStatus.ERROR,
+                AlertStatus.CANCELLED
+            )
+            val effectiveStatus = if (hasUpdatedTerminalState) {
+                latest!!.status
             } else {
                 result.status
             }
-            val effectiveSmsNote = if (latest != null && latest.status in listOf(
-                    AlertStatus.SENT_BY_DEVICE,
-                    AlertStatus.DELIVERED
-                )
-            ) {
+            val effectiveSmsNote = if (hasUpdatedTerminalState && latest!!.smsStatusNote.isNotBlank()) {
                 latest.smsStatusNote
             } else {
                 result.smsStatusSummary
+            }
+            val effectiveLocationNote = if (effectiveStatus == AlertStatus.CANCELLED) {
+                "Cancelada durante la preparación"
+            } else {
+                result.locationSummary
             }
 
             _uiState.update {
                 it.copy(
                     activeAlertStatus = effectiveStatus,
-                    activeLocationStatusText = result.locationSummary,
+                    activeLocationStatusText = effectiveLocationNote,
                     activeSmsStatusText = effectiveSmsNote
                 )
             }
             upsertEvent(
                 requestId = requestId,
-                title = if (origin == AlertOrigin.WATCH_DATA_LAYER) {
-                    "Solicitud SOS desde reloj"
-                } else {
-                    "Solicitud SOS desde teléfono"
+                title = when {
+                    effectiveStatus == AlertStatus.CANCELLED -> "Alerta cancelada"
+                    origin == AlertOrigin.WATCH_DATA_LAYER -> "Solicitud SOS desde reloj"
+                    else -> "Solicitud SOS desde teléfono"
                 },
                 status = effectiveStatus,
                 origin = origin,
-                locationNote = result.locationSummary,
+                locationNote = effectiveLocationNote,
                 smsStatusNote = effectiveSmsNote
             )
         }
@@ -333,8 +342,12 @@ class MobileAlertViewModel(
 
     fun cancelActiveAlert() {
         val current = _uiState.value
-        // Solo se puede cancelar antes de que el SMS haya sido enviado por el dispositivo
-        if (current.activeAlertStatus in listOf(AlertStatus.SENT_BY_DEVICE, AlertStatus.DELIVERED)) {
+        // Solo se puede cancelar mientras la alerta está recibida o buscando ubicación (antes de invocar SmsManager)
+        val canStillCancel = current.activeAlertStatus in listOf(
+            AlertStatus.RECEIVED,
+            AlertStatus.PREPARING_LOCATION
+        )
+        if (!canStillCancel) {
             _uiState.update { it.copy(currentScreen = MobileScreen.HISTORY) }
             return
         }

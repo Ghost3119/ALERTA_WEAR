@@ -491,4 +491,25 @@ class MobileAlertViewModelTest {
         assertTrue(afterFailure!!.smsStatusNote.contains("Sin servicio móvil / sin señal"))
         assertTrue(watchAcks.contains(RealLocationAlertGateway.ACK_ERROR_SMS_FAILED))
     }
+
+    @Test
+    fun `cancelActiveAlert after SMS dispatch started navigates to history without overwriting status to CANCELLED`() = runTest {
+        val storage = InMemoryAlertStorage(
+            initialContact = TrustedContact("Carlos", "+52 800 999 8888")
+        )
+        val locProvider = FakeLocationProvider()
+        val smsSender = FakePhoneSmsSender()
+        val gateway = RealLocationAlertGateway(locProvider, smsSender)
+        val monitor = FakeWatchMonitor()
+        val viewModel = MobileAlertViewModel(storage, gateway, monitor, locProvider, smsSender)
+
+        viewModel.triggerAlertPreparation(requestId = "req_already_sending", origin = AlertOrigin.WATCH_DATA_LAYER)
+        advanceUntilIdle()
+        assertEquals(AlertStatus.SENDING_SMS, viewModel.uiState.value.activeAlertStatus)
+
+        // Al pulsar el botón de acción cuando ya está en SENDING_SMS, debe ir a Historial sin marcar CANCELLED
+        viewModel.cancelActiveAlert()
+        assertEquals(MobileScreen.HISTORY, viewModel.uiState.value.currentScreen)
+        assertEquals(AlertStatus.SENDING_SMS, storage.findEventByRequestId("req_already_sending")?.status)
+    }
 }

@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
@@ -50,6 +51,10 @@ class WearAlertViewModelTest {
             sentRequestIds.add(requestId)
             return true
         }
+
+        override fun clearLastAck() {
+            ackFlow.value = null
+        }
     }
 
     @Before
@@ -65,7 +70,7 @@ class WearAlertViewModelTest {
     @Test
     fun `initial state shows disconnected when no phone node is paired`() = runTest {
         val bridge = FakeWearPhoneBridge(isConnected = false)
-        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L)
+        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L, ackTimeoutMs = 5000L)
 
         advanceUntilIdle()
         assertFalse(viewModel.uiState.value.isPhoneConnected)
@@ -76,7 +81,7 @@ class WearAlertViewModelTest {
     @Test
     fun `countdown starts and can be cancelled before sending request to phone`() = runTest {
         val bridge = FakeWearPhoneBridge(isConnected = true)
-        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L)
+        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L, ackTimeoutMs = 5000L)
 
         viewModel.onSosLongPressed()
         advanceTimeBy(150L)
@@ -93,17 +98,18 @@ class WearAlertViewModelTest {
     @Test
     fun `countdown when disconnected transitions to NO_CONNECTION and retry reuses same requestId`() = runTest {
         val bridge = FakeWearPhoneBridge(isConnected = false)
-        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L)
+        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L, ackTimeoutMs = 5000L)
 
         viewModel.onSosLongPressed()
-        advanceUntilIdle()
+        advanceTimeBy(600L)
+        runCurrent()
         assertEquals(WearScreen.NO_CONNECTION, viewModel.uiState.value.currentScreen)
         val initialRequestId = viewModel.uiState.value.activeRequestId
 
         // Ahora el teléfono se conecta y el usuario presiona Reintentar
         bridge.isConnected = true
         viewModel.retryFromNoConnection()
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(WearScreen.IN_PROGRESS, viewModel.uiState.value.currentScreen)
         assertEquals(1, bridge.sentRequestIds.size)
@@ -113,17 +119,18 @@ class WearAlertViewModelTest {
     @Test
     fun `send failure transitions to NO_CONNECTION and allows retry with same requestId`() = runTest {
         val bridge = FakeWearPhoneBridge(isConnected = true, sendSuccess = false)
-        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L)
+        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L, ackTimeoutMs = 5000L)
 
         viewModel.onSosLongPressed()
-        advanceUntilIdle()
+        advanceTimeBy(600L)
+        runCurrent()
         assertEquals(WearScreen.NO_CONNECTION, viewModel.uiState.value.currentScreen)
         assertTrue(viewModel.uiState.value.noConnectionReason.contains("No se pudo enviar"))
         val reqId = viewModel.uiState.value.activeRequestId
 
         bridge.sendSuccess = true
         viewModel.retryFromNoConnection()
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(WearScreen.IN_PROGRESS, viewModel.uiState.value.currentScreen)
         assertEquals(listOf(reqId), bridge.sentRequestIds)
@@ -132,10 +139,11 @@ class WearAlertViewModelTest {
     @Test
     fun `receiving ACK updates watch screen through preparation, sending, sent unconfirmed, and delivered states`() = runTest {
         val bridge = FakeWearPhoneBridge(isConnected = true)
-        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L)
+        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L, ackTimeoutMs = 5000L)
 
         viewModel.onSosLongPressed()
-        advanceUntilIdle()
+        advanceTimeBy(600L)
+        runCurrent()
         assertEquals(WearScreen.IN_PROGRESS, viewModel.uiState.value.currentScreen)
         val reqId = viewModel.uiState.value.activeRequestId!!
 
@@ -144,7 +152,7 @@ class WearAlertViewModelTest {
             ackStatus = "RECEIVED_PREPARING",
             detail = "Buscando ubicación..."
         )
-        advanceUntilIdle()
+        runCurrent()
         assertEquals("Solicitud recibida", viewModel.uiState.value.inProgressTitle)
 
         bridge.ackFlow.value = PhoneAckPayload(
@@ -152,7 +160,7 @@ class WearAlertViewModelTest {
             ackStatus = "SENDING_SMS_WITH_LOCATION",
             detail = "Enviando SMS con ubicación"
         )
-        advanceUntilIdle()
+        runCurrent()
         assertEquals("Enviando SMS", viewModel.uiState.value.inProgressTitle)
         assertTrue(viewModel.uiState.value.inProgressSubtitle.contains("Ubicación incluida"))
 
@@ -161,7 +169,7 @@ class WearAlertViewModelTest {
             ackStatus = "SENDING_SMS_NO_LOCATION",
             detail = "Enviando SMS sin ubicación"
         )
-        advanceUntilIdle()
+        runCurrent()
         assertEquals("Enviando SMS", viewModel.uiState.value.inProgressTitle)
         assertTrue(viewModel.uiState.value.inProgressSubtitle.contains("Sin ubicación disponible"))
 
@@ -170,7 +178,7 @@ class WearAlertViewModelTest {
             ackStatus = "SMS_SENT_BY_DEVICE",
             detail = "SMS enviado por el teléfono (entrega sin confirmar)"
         )
-        advanceUntilIdle()
+        runCurrent()
         assertEquals("SMS enviado", viewModel.uiState.value.inProgressTitle)
         assertTrue(viewModel.uiState.value.inProgressSubtitle.contains("Por el dispositivo"))
         assertTrue(viewModel.uiState.value.statusDetailMessage.contains("sin confirmar"))
@@ -180,29 +188,55 @@ class WearAlertViewModelTest {
             ackStatus = "SMS_DELIVERED",
             detail = "Entrega confirmada"
         )
-        advanceUntilIdle()
+        runCurrent()
         assertEquals("SMS entregado", viewModel.uiState.value.inProgressTitle)
     }
 
     @Test
     fun `receiving error ACKs from phone displays clear error states on watch`() = runTest {
         val bridge = FakeWearPhoneBridge(isConnected = true)
-        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L)
+        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L, ackTimeoutMs = 5000L)
 
         viewModel.onSosLongPressed()
-        advanceUntilIdle()
+        advanceTimeBy(600L)
+        runCurrent()
         val reqId = viewModel.uiState.value.activeRequestId!!
 
         bridge.ackFlow.value = PhoneAckPayload(reqId, "ERROR_NO_CONTACT", "Sin contacto")
-        advanceUntilIdle()
+        runCurrent()
         assertEquals("Falta contacto", viewModel.uiState.value.inProgressTitle)
 
         bridge.ackFlow.value = PhoneAckPayload(reqId, "ERROR_NO_SMS_PERM", "Sin permiso SMS")
-        advanceUntilIdle()
+        runCurrent()
         assertEquals("Permiso SMS", viewModel.uiState.value.inProgressTitle)
 
         bridge.ackFlow.value = PhoneAckPayload(reqId, "ERROR_SMS_FAILED", "Fallo red")
-        advanceUntilIdle()
+        runCurrent()
         assertEquals("Error de envío", viewModel.uiState.value.inProgressTitle)
+    }
+
+    @Test
+    fun `missing ACK after timeout transitions watch out of preparing to unconfirmed without claiming success or failure`() = runTest {
+        val bridge = FakeWearPhoneBridge(isConnected = true)
+        val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L, ackTimeoutMs = 2000L)
+
+        viewModel.onSosLongPressed()
+        advanceTimeBy(600L)
+        runCurrent()
+        val reqId = viewModel.uiState.value.activeRequestId!!
+
+        // Llega RECEIVED_PREPARING ("Preparando ubicación...") pero se pierde el resto de respuestas
+        bridge.ackFlow.value = PhoneAckPayload(reqId, "RECEIVED_PREPARING", "Preparando...")
+        runCurrent()
+        assertEquals("Solicitud recibida", viewModel.uiState.value.inProgressTitle)
+        assertEquals("Preparando ubicación...", viewModel.uiState.value.statusDetailMessage)
+
+        // Transcurre el tiempo límite sin confirmación final
+        advanceTimeBy(2100L)
+        runCurrent()
+
+        assertEquals("Sin confirmación", viewModel.uiState.value.inProgressTitle)
+        assertEquals("Revisa tu teléfono", viewModel.uiState.value.inProgressSubtitle)
+        assertEquals("No se pudo confirmar el resultado", viewModel.uiState.value.statusDetailMessage)
     }
 }

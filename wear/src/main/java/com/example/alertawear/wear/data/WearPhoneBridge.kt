@@ -31,6 +31,7 @@ interface WearPhoneBridge {
     val incomingAckFlow: StateFlow<PhoneAckPayload?>
     suspend fun checkPhoneConnection(): PhoneNodeConnection
     suspend fun sendSosRequest(requestId: String): Boolean
+    fun clearLastAck() {}
 }
 
 object WearAckEventBus {
@@ -51,6 +52,10 @@ class RealWearPhoneBridge(
 ) : WearPhoneBridge {
 
     override val incomingAckFlow: StateFlow<PhoneAckPayload?> = WearAckEventBus.incomingAck
+
+    override fun clearLastAck() {
+        WearAckEventBus.clear()
+    }
 
     override suspend fun checkPhoneConnection(): PhoneNodeConnection {
         return try {

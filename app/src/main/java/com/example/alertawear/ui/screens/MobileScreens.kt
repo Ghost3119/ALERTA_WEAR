@@ -705,9 +705,9 @@ fun MobileAlertInProgressScreen(
 
         Spacer(modifier = Modifier.height(28.dp))
 
-        val isAlreadySent = uiState.activeAlertStatus in listOf(
-            AlertStatus.SENT_BY_DEVICE,
-            AlertStatus.DELIVERED
+        val canStillCancel = uiState.activeAlertStatus in listOf(
+            AlertStatus.RECEIVED,
+            AlertStatus.PREPARING_LOCATION
         )
         Button(
             onClick = onCancelActiveAlert,
@@ -721,7 +721,7 @@ fun MobileAlertInProgressScreen(
                 .height(54.dp)
         ) {
             Text(
-                text = if (isAlreadySent) "Ver en Historial" else "Cancelar alerta",
+                text = if (canStillCancel) "Cancelar alerta" else "Ver en Historial",
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Bold
             )
