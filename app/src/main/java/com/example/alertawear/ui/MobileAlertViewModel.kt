@@ -7,6 +7,7 @@ import com.example.alertawear.data.AlertEventBus
 import com.example.alertawear.data.AlertPreparationGateway
 import com.example.alertawear.data.LocalAlertStorage
 import com.example.alertawear.data.PhoneLocationProvider
+import com.example.alertawear.data.PhoneSmsSender
 import com.example.alertawear.data.SharedPrefsAlertStorage
 import com.example.alertawear.data.WatchConnectionMonitor
 import com.example.alertawear.model.AlertHistoryEvent
@@ -34,16 +35,18 @@ data class MobileUiState(
     val watchConnection: WatchConnectionState = WatchConnectionState(),
     val hasLocationPermission: Boolean = false,
     val isLocationServicesEnabled: Boolean = false,
+    val hasSendSmsPermission: Boolean = false,
+    val canDeviceSendSms: Boolean = false,
     val trustedContact: TrustedContact? = null,
     val draftContactName: String = "",
     val draftContactPhone: String = "",
     val contactSavedFeedback: String? = null,
     val countdownSeconds: Int? = null,
     val activeRequestId: String? = null,
-    val activeAlertStatus: AlertStatus = AlertStatus.PENDING,
+    val activeAlertStatus: AlertStatus = AlertStatus.PREPARING_LOCATION,
     val activeAlertOrigin: AlertOrigin = AlertOrigin.WATCH_DATA_LAYER,
     val activeLocationStatusText: String = "Esperando solicitud SOS...",
-    val activeDetailText: String = "Envío pendiente de confirmación",
+    val activeSmsStatusText: String = "Envío pendiente de confirmación",
     val historyEvents: List<AlertHistoryEvent> = emptyList()
 )
 
@@ -52,6 +55,7 @@ class MobileAlertViewModel(
     private val gateway: AlertPreparationGateway,
     private val watchConnectionMonitor: WatchConnectionMonitor,
     private val locationProvider: PhoneLocationProvider,
+    private val smsSender: PhoneSmsSender,
     private val countdownTickMs: Long = 1000L
 ) : ViewModel() {
 
@@ -71,13 +75,15 @@ class MobileAlertViewModel(
                 draftContactPhone = savedContact?.phone.orEmpty(),
                 hasLocationPermission = locationProvider.hasForegroundLocationPermission(),
                 isLocationServicesEnabled = locationProvider.isLocationEnabled(),
+                hasSendSmsPermission = smsSender.hasSendSmsPermission(),
+                canDeviceSendSms = smsSender.canDeviceSendSms(),
                 historyEvents = savedHistory
             )
         }
 
         refreshDeviceAndLocationStatus()
 
-        // Observar solicitudes reales que llegan desde el reloj vía PhoneWearableListenerService
+        // Observar actualizaciones en tiempo real de PhoneWearableListenerService y SmsStatusBroadcastReceiver
         viewModelScope.launch {
             AlertEventBus.latestIncomingEvent.collect { incomingEvent ->
                 if (incomingEvent != null) {
@@ -89,7 +95,7 @@ class MobileAlertViewModel(
                             activeAlertOrigin = incomingEvent.origin,
                             activeAlertStatus = incomingEvent.status,
                             activeLocationStatusText = incomingEvent.locationNote,
-                            activeDetailText = incomingEvent.status.displayLabel,
+                            activeSmsStatusText = incomingEvent.smsStatusNote.ifBlank { incomingEvent.status.displayLabel },
                             historyEvents = updatedList
                         )
                     }
@@ -101,26 +107,31 @@ class MobileAlertViewModel(
     fun refreshDeviceAndLocationStatus() {
         viewModelScope.launch {
             val connection = watchConnectionMonitor.checkConnectedWatch()
-            val hasPerm = locationProvider.hasForegroundLocationPermission()
+            val hasLocPerm = locationProvider.hasForegroundLocationPermission()
             val gpsEnabled = locationProvider.isLocationEnabled()
+            val hasSmsPerm = smsSender.hasSendSmsPermission()
+            val simReady = smsSender.canDeviceSendSms()
             val latestHistory = storage.loadHistory()
             _uiState.update {
                 it.copy(
                     watchConnection = connection,
-                    hasLocationPermission = hasPerm,
+                    hasLocationPermission = hasLocPerm,
                     isLocationServicesEnabled = gpsEnabled,
+                    hasSendSmsPermission = hasSmsPerm,
+                    canDeviceSendSms = simReady,
                     historyEvents = latestHistory
                 )
             }
         }
     }
 
-    fun onLocationPermissionResult(granted: Boolean) {
-        val gpsEnabled = locationProvider.isLocationEnabled()
+    fun onPermissionsResult() {
         _uiState.update {
             it.copy(
-                hasLocationPermission = granted || locationProvider.hasForegroundLocationPermission(),
-                isLocationServicesEnabled = gpsEnabled
+                hasLocationPermission = locationProvider.hasForegroundLocationPermission(),
+                isLocationServicesEnabled = locationProvider.isLocationEnabled(),
+                hasSendSmsPermission = smsSender.hasSendSmsPermission(),
+                canDeviceSendSms = smsSender.canDeviceSendSms()
             )
         }
     }
@@ -174,7 +185,7 @@ class MobileAlertViewModel(
     }
 
     /**
-     * Inicia la cuenta regresiva cancelable de 5 segundos al mantener presionado SOS en el teléfono.
+     * Inicia la cuenta regresiva cancelable de 5 segundos antes de iniciar cualquier envío de SMS.
      */
     fun startSosCountdown(origin: AlertOrigin = AlertOrigin.PHONE_LOCAL) {
         countdownJob?.cancel()
@@ -207,13 +218,13 @@ class MobileAlertViewModel(
             title = "Alerta cancelada en cuenta regresiva",
             status = AlertStatus.CANCELLED,
             origin = current.activeAlertOrigin,
-            locationNote = "Cancelada antes de solicitar ubicación"
+            locationNote = "Cancelada antes de solicitar ubicación",
+            smsStatusNote = "No se envió ningún SMS."
         )
     }
 
     /**
-     * Ejecuta la preparación real de la alerta en el teléfono (intentando obtener ubicación real
-     * y deduplicando por `requestId`).
+     * Ejecuta la preparación de ubicación y el envío real de SMS de prueba, deduplicando por `requestId`.
      */
     fun triggerAlertPreparation(
         requestId: String = "req_${System.currentTimeMillis()}",
@@ -222,15 +233,35 @@ class MobileAlertViewModel(
         countdownJob?.cancel()
         preparationJob?.cancel()
 
+        // Evitar duplicados si este requestId ya envió o está enviando SMS
+        val existing = storage.findEventByRequestId(requestId)
+        if (existing != null && existing.status in listOf(
+                AlertStatus.SENDING_SMS,
+                AlertStatus.SENT_BY_DEVICE,
+                AlertStatus.DELIVERED
+            )
+        ) {
+            _uiState.update {
+                it.copy(
+                    currentScreen = MobileScreen.ALERT_IN_PROGRESS,
+                    activeRequestId = requestId,
+                    activeAlertStatus = existing.status,
+                    activeLocationStatusText = existing.locationNote,
+                    activeSmsStatusText = existing.smsStatusNote
+                )
+            }
+            return
+        }
+
         _uiState.update {
             it.copy(
                 currentScreen = MobileScreen.ALERT_IN_PROGRESS,
                 countdownSeconds = null,
                 activeRequestId = requestId,
                 activeAlertOrigin = origin,
-                activeAlertStatus = AlertStatus.PENDING,
+                activeAlertStatus = AlertStatus.PREPARING_LOCATION,
                 activeLocationStatusText = "Buscando ubicación...",
-                activeDetailText = "Solicitud recibida · Preparando aviso"
+                activeSmsStatusText = "Preparando envío de SMS de prueba..."
             )
         }
 
@@ -241,23 +272,48 @@ class MobileAlertViewModel(
             } else {
                 "Solicitud SOS desde teléfono"
             },
-            status = AlertStatus.PENDING,
+            status = AlertStatus.PREPARING_LOCATION,
             origin = origin,
-            locationNote = "Buscando ubicación..."
+            locationNote = "Buscando ubicación...",
+            smsStatusNote = "Preparando envío de SMS de prueba..."
         )
 
         preparationJob = viewModelScope.launch {
             val contact = _uiState.value.trustedContact
-            val result = gateway.prepareAlert(
+            val result = gateway.prepareAndSendAlert(
+                requestId = requestId,
+                sourceNodeId = null,
                 contact = contact,
                 origin = origin,
                 isAppInForeground = true
             )
+
+            // Respetar si SmsStatusBroadcastReceiver ya actualizó a SENT_BY_DEVICE o DELIVERED
+            val latest = storage.findEventByRequestId(requestId)
+            val effectiveStatus = if (latest != null && latest.status in listOf(
+                    AlertStatus.SENT_BY_DEVICE,
+                    AlertStatus.DELIVERED
+                )
+            ) {
+                latest.status
+            } else {
+                result.status
+            }
+            val effectiveSmsNote = if (latest != null && latest.status in listOf(
+                    AlertStatus.SENT_BY_DEVICE,
+                    AlertStatus.DELIVERED
+                )
+            ) {
+                latest.smsStatusNote
+            } else {
+                result.smsStatusSummary
+            }
+
             _uiState.update {
                 it.copy(
-                    activeAlertStatus = result.status,
+                    activeAlertStatus = effectiveStatus,
                     activeLocationStatusText = result.locationSummary,
-                    activeDetailText = result.detailMessage
+                    activeSmsStatusText = effectiveSmsNote
                 )
             }
             upsertEvent(
@@ -267,23 +323,29 @@ class MobileAlertViewModel(
                 } else {
                     "Solicitud SOS desde teléfono"
                 },
-                status = result.status,
+                status = effectiveStatus,
                 origin = origin,
-                locationNote = result.locationSummary
+                locationNote = result.locationSummary,
+                smsStatusNote = effectiveSmsNote
             )
         }
     }
 
     fun cancelActiveAlert() {
+        val current = _uiState.value
+        // Solo se puede cancelar antes de que el SMS haya sido enviado por el dispositivo
+        if (current.activeAlertStatus in listOf(AlertStatus.SENT_BY_DEVICE, AlertStatus.DELIVERED)) {
+            _uiState.update { it.copy(currentScreen = MobileScreen.HISTORY) }
+            return
+        }
         countdownJob?.cancel()
         preparationJob?.cancel()
-        val current = _uiState.value
         val reqId = current.activeRequestId ?: "cancel_${System.currentTimeMillis()}"
         _uiState.update {
             it.copy(
                 activeAlertStatus = AlertStatus.CANCELLED,
                 activeLocationStatusText = "Preparación detenida por el usuario",
-                activeDetailText = "Alerta cancelada. No se realizó ningún envío.",
+                activeSmsStatusText = "Alerta cancelada antes de enviar SMS.",
                 currentScreen = MobileScreen.HISTORY
             )
         }
@@ -292,7 +354,8 @@ class MobileAlertViewModel(
             title = "Alerta cancelada",
             status = AlertStatus.CANCELLED,
             origin = current.activeAlertOrigin,
-            locationNote = "Cancelada durante la preparación"
+            locationNote = "Cancelada durante la preparación",
+            smsStatusNote = "Alerta cancelada antes de enviar SMS."
         )
     }
 
@@ -301,7 +364,8 @@ class MobileAlertViewModel(
         title: String,
         status: AlertStatus,
         origin: AlertOrigin,
-        locationNote: String
+        locationNote: String,
+        smsStatusNote: String
     ) {
         val event = AlertHistoryEvent(
             id = "evt_$requestId",
@@ -311,6 +375,7 @@ class MobileAlertViewModel(
             status = status,
             origin = origin,
             locationNote = locationNote,
+            smsStatusNote = smsStatusNote,
             isSimulated = false
         )
         val updated = storage.upsertHistoryEventByRequestId(event)
@@ -321,7 +386,8 @@ class MobileAlertViewModel(
         private val storage: LocalAlertStorage,
         private val gateway: AlertPreparationGateway,
         private val watchConnectionMonitor: WatchConnectionMonitor,
-        private val locationProvider: PhoneLocationProvider
+        private val locationProvider: PhoneLocationProvider,
+        private val smsSender: PhoneSmsSender
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -329,7 +395,8 @@ class MobileAlertViewModel(
                 storage = storage,
                 gateway = gateway,
                 watchConnectionMonitor = watchConnectionMonitor,
-                locationProvider = locationProvider
+                locationProvider = locationProvider,
+                smsSender = smsSender
             ) as T
         }
     }

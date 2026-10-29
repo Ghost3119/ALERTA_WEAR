@@ -2,8 +2,11 @@ package com.example.alertawear
 
 import com.example.alertawear.data.InMemoryAlertStorage
 import com.example.alertawear.data.PhoneLocationProvider
+import com.example.alertawear.data.PhoneSmsSender
 import com.example.alertawear.data.PhoneSosRequestProcessor
 import com.example.alertawear.data.RealLocationAlertGateway
+import com.example.alertawear.data.SmsDispatchSubmission
+import com.example.alertawear.data.SmsSubmissionOutcome
 import com.example.alertawear.data.WatchConnectionMonitor
 import com.example.alertawear.model.AlertOrigin
 import com.example.alertawear.model.AlertStatus
@@ -29,6 +32,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.util.Locale
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class MobileAlertViewModelTest {
@@ -48,6 +52,64 @@ class MobileAlertViewModelTest {
         override fun hasForegroundLocationPermission(): Boolean = hasPermission
         override fun isLocationEnabled(): Boolean = isEnabled
         override suspend fun obtainLocation(isAppInForeground: Boolean): LocationResult = result
+    }
+
+    private class FakePhoneSmsSender(
+        var hasPermission: Boolean = true,
+        var canSend: Boolean = true
+    ) : PhoneSmsSender {
+        data class DispatchedSms(
+            val requestId: String,
+            val sourceNodeId: String?,
+            val contact: TrustedContact,
+            val messageBody: String
+        )
+
+        val dispatchedMessages = mutableListOf<DispatchedSms>()
+
+        override fun hasSendSmsPermission(): Boolean = hasPermission
+        override fun canDeviceSendSms(): Boolean = canSend
+
+        override fun buildTestAlertMessage(locationResult: LocationResult): String {
+            return if (locationResult.mapsUrl != null) {
+                val lat = String.format(Locale.US, "%.5f", locationResult.latitude)
+                val lon = String.format(Locale.US, "%.5f", locationResult.longitude)
+                "Alerta de prueba de Alerta Wear. Necesito ayuda.\nMi ubicación: https://maps.google.com/?q=$lat,$lon"
+            } else {
+                "Alerta de prueba de Alerta Wear. Necesito ayuda.\nUbicación no disponible (${locationResult.status.label})."
+            }
+        }
+
+        override fun sendAlertSms(
+            requestId: String,
+            sourceNodeId: String?,
+            contact: TrustedContact,
+            messageBody: String
+        ): SmsDispatchSubmission {
+            if (!contact.isValid) {
+                return SmsDispatchSubmission(
+                    outcome = SmsSubmissionOutcome.ERROR_INVALID_CONTACT,
+                    detailMessage = "Error: Contacto de confianza no válido."
+                )
+            }
+            if (!hasPermission) {
+                return SmsDispatchSubmission(
+                    outcome = SmsSubmissionOutcome.ERROR_NO_PERMISSION,
+                    detailMessage = "Error: Permiso SEND_SMS denegado en el teléfono."
+                )
+            }
+            if (!canSend) {
+                return SmsDispatchSubmission(
+                    outcome = SmsSubmissionOutcome.ERROR_NO_SIM_OR_CAPABILITY,
+                    detailMessage = "Error: El teléfono no tiene tarjeta SIM lista o capacidad de telefonía."
+                )
+            }
+            dispatchedMessages.add(DispatchedSms(requestId, sourceNodeId, contact, messageBody))
+            return SmsDispatchSubmission(
+                outcome = SmsSubmissionOutcome.DISPATCH_INITIATED,
+                detailMessage = "Enviando SMS de prueba a ${contact.name} (${contact.phone})..."
+            )
+        }
     }
 
     private class FakeWatchMonitor(
@@ -73,11 +135,12 @@ class MobileAlertViewModelTest {
     fun `initial watch connection reflects real monitor state`() = runTest {
         val storage = InMemoryAlertStorage()
         val locProvider = FakeLocationProvider()
-        val gateway = RealLocationAlertGateway(locProvider)
+        val smsSender = FakePhoneSmsSender()
+        val gateway = RealLocationAlertGateway(locProvider, smsSender)
         val monitor = FakeWatchMonitor(
             WatchConnectionState(isConnected = false, isChecking = false)
         )
-        val viewModel = MobileAlertViewModel(storage, gateway, monitor, locProvider)
+        val viewModel = MobileAlertViewModel(storage, gateway, monitor, locProvider, smsSender)
 
         advanceUntilIdle()
         assertFalse(viewModel.uiState.value.watchConnection.isConnected)
@@ -87,9 +150,10 @@ class MobileAlertViewModelTest {
     fun `saveContact persists valid contact and updates state`() = runTest {
         val storage = InMemoryAlertStorage()
         val locProvider = FakeLocationProvider()
-        val gateway = RealLocationAlertGateway(locProvider)
+        val smsSender = FakePhoneSmsSender()
+        val gateway = RealLocationAlertGateway(locProvider, smsSender)
         val monitor = FakeWatchMonitor()
-        val viewModel = MobileAlertViewModel(storage, gateway, monitor, locProvider)
+        val viewModel = MobileAlertViewModel(storage, gateway, monitor, locProvider, smsSender)
 
         viewModel.onDraftNameChanged("María")
         viewModel.onDraftPhoneChanged("+52 844 000 0000")
@@ -107,13 +171,15 @@ class MobileAlertViewModelTest {
             initialContact = TrustedContact("María", "+52 844 123 4567")
         )
         val locProvider = FakeLocationProvider()
-        val gateway = RealLocationAlertGateway(locProvider)
+        val smsSender = FakePhoneSmsSender()
+        val gateway = RealLocationAlertGateway(locProvider, smsSender)
         val monitor = FakeWatchMonitor()
         val viewModel = MobileAlertViewModel(
             storage = storage,
             gateway = gateway,
             watchConnectionMonitor = monitor,
             locationProvider = locProvider,
+            smsSender = smsSender,
             countdownTickMs = 100L
         )
 
@@ -124,15 +190,17 @@ class MobileAlertViewModelTest {
         viewModel.cancelCountdown()
         assertNull(viewModel.uiState.value.countdownSeconds)
         assertEquals(AlertStatus.CANCELLED, viewModel.uiState.value.historyEvents.first().status)
+        assertEquals(0, smsSender.dispatchedMessages.size)
     }
 
     @Test
-    fun `processor deduplicates repeated requestId on retry and sends ACKs`() = runTest {
+    fun `processor deduplicates repeated requestId on retry and never sends duplicate SMS`() = runTest {
         val storage = InMemoryAlertStorage(
             initialContact = TrustedContact("Carlos", "+52 844 999 8888")
         )
         val locProvider = FakeLocationProvider()
-        val gateway = RealLocationAlertGateway(locProvider)
+        val smsSender = FakePhoneSmsSender()
+        val gateway = RealLocationAlertGateway(locProvider, smsSender)
         val sentAcks = mutableListOf<String>()
 
         val processor = PhoneSosRequestProcessor(
@@ -148,17 +216,24 @@ class MobileAlertViewModelTest {
         // Reintento con el mismo requestId "sos_100"
         processor.processIncomingSos("node_1", "sos_100", isAppInForeground = true)
 
-        // El historial debe tener exactamente 1 registro para "sos_100", no duplicados
+        // El historial debe tener 1 registro en SENDING_SMS (no marcado aún como enviado sin broadcast)
+        // y el SMS solo debe haberse despachado 1 vez
         val history = storage.loadHistory()
         assertEquals(1, history.size)
         assertEquals("sos_100", history.first().requestId)
-        assertEquals(AlertStatus.PREPARED, history.first().status)
+        assertEquals(AlertStatus.SENDING_SMS, history.first().status)
+        assertEquals(1, smsSender.dispatchedMessages.size)
+        assertTrue(
+            smsSender.dispatchedMessages.first().messageBody.contains(
+                "https://maps.google.com/?q=25.42321,-101.00530"
+            )
+        )
         assertTrue(sentAcks.contains(RealLocationAlertGateway.ACK_RECEIVED_PREPARING))
-        assertTrue(sentAcks.contains(RealLocationAlertGateway.ACK_PREPARED_WITH_LOCATION))
+        assertTrue(sentAcks.contains(RealLocationAlertGateway.ACK_SENDING_SMS_WITH_LOCATION))
     }
 
     @Test
-    fun `permission denied still prepares alert with clear no-location note`() = runTest {
+    fun `location permission denied still sends SMS indicating location unavailable`() = runTest {
         val storage = InMemoryAlertStorage(
             initialContact = TrustedContact("Carlos", "+52 844 999 8888")
         )
@@ -169,15 +244,38 @@ class MobileAlertViewModelTest {
                 detailText = "Permiso de ubicación denegado en el teléfono."
             )
         )
-        val gateway = RealLocationAlertGateway(locProvider)
+        val smsSender = FakePhoneSmsSender()
+        val gateway = RealLocationAlertGateway(locProvider, smsSender)
         val monitor = FakeWatchMonitor()
-        val viewModel = MobileAlertViewModel(storage, gateway, monitor, locProvider)
+        val viewModel = MobileAlertViewModel(storage, gateway, monitor, locProvider, smsSender)
 
         viewModel.triggerAlertPreparation(requestId = "req_perm_denied", origin = AlertOrigin.WATCH_DATA_LAYER)
         advanceUntilIdle()
 
         assertEquals(MobileScreen.ALERT_IN_PROGRESS, viewModel.uiState.value.currentScreen)
-        assertEquals(AlertStatus.PREPARED, viewModel.uiState.value.activeAlertStatus)
-        assertTrue(viewModel.uiState.value.activeLocationStatusText.contains("Permiso de ubicación denegado"))
+        assertEquals(AlertStatus.SENDING_SMS, viewModel.uiState.value.activeAlertStatus)
+        assertEquals(1, smsSender.dispatchedMessages.size)
+        val body = smsSender.dispatchedMessages.first().messageBody
+        assertTrue(body.contains("Alerta de prueba de Alerta Wear"))
+        assertTrue(body.contains("Ubicación no disponible"))
+    }
+
+    @Test
+    fun `missing SEND_SMS permission sets ERROR state and does not dispatch SMS`() = runTest {
+        val storage = InMemoryAlertStorage(
+            initialContact = TrustedContact("Carlos", "+52 844 999 8888")
+        )
+        val locProvider = FakeLocationProvider()
+        val smsSender = FakePhoneSmsSender(hasPermission = false)
+        val gateway = RealLocationAlertGateway(locProvider, smsSender)
+        val monitor = FakeWatchMonitor()
+        val viewModel = MobileAlertViewModel(storage, gateway, monitor, locProvider, smsSender)
+
+        viewModel.triggerAlertPreparation(requestId = "req_no_sms_perm", origin = AlertOrigin.WATCH_DATA_LAYER)
+        advanceUntilIdle()
+
+        assertEquals(AlertStatus.ERROR, viewModel.uiState.value.activeAlertStatus)
+        assertEquals(0, smsSender.dispatchedMessages.size)
+        assertTrue(viewModel.uiState.value.activeSmsStatusText.contains("Permiso SEND_SMS denegado"))
     }
 }

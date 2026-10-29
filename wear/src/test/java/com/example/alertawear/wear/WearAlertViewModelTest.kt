@@ -10,7 +10,6 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
-import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -93,7 +92,7 @@ class WearAlertViewModelTest {
     }
 
     @Test
-    fun `receiving ACK updates watch screen to reflect phone preparation state`() = runTest {
+    fun `receiving ACK updates watch screen through preparation, sending, sent, and delivered states`() = runTest {
         val bridge = FakeWearPhoneBridge(isConnected = true)
         val viewModel = WearAlertViewModel(bridge = bridge, countdownTickMs = 100L)
 
@@ -112,11 +111,29 @@ class WearAlertViewModelTest {
 
         bridge.ackFlow.value = PhoneAckPayload(
             requestId = reqId,
-            ackStatus = "PREPARED_WITH_LOCATION",
-            detail = "Ubicación lista"
+            ackStatus = "SENDING_SMS_WITH_LOCATION",
+            detail = "Enviando SMS con ubicación"
         )
         advanceUntilIdle()
-        assertEquals("Aviso preparado", viewModel.uiState.value.inProgressTitle)
-        assertTrue(viewModel.uiState.value.statusDetailMessage.contains("Sin envío"))
+        assertEquals("Enviando SMS", viewModel.uiState.value.inProgressTitle)
+        assertTrue(viewModel.uiState.value.inProgressSubtitle.contains("Ubicación incluida"))
+
+        bridge.ackFlow.value = PhoneAckPayload(
+            requestId = reqId,
+            ackStatus = "SMS_SENT_BY_DEVICE",
+            detail = "SMS enviado por el teléfono (entrega sin confirmar)"
+        )
+        advanceUntilIdle()
+        assertEquals("SMS enviado", viewModel.uiState.value.inProgressTitle)
+        assertTrue(viewModel.uiState.value.inProgressSubtitle.contains("Por el dispositivo"))
+        assertTrue(viewModel.uiState.value.statusDetailMessage.contains("sin confirmar"))
+
+        bridge.ackFlow.value = PhoneAckPayload(
+            requestId = reqId,
+            ackStatus = "SMS_DELIVERED",
+            detail = "Entrega confirmada"
+        )
+        advanceUntilIdle()
+        assertEquals("SMS entregado", viewModel.uiState.value.inProgressTitle)
     }
 }

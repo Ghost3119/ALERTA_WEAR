@@ -13,6 +13,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.alertawear.data.AlertEventBus
+import com.example.alertawear.data.AndroidPhoneSmsSender
 import com.example.alertawear.data.FusedPhoneLocationProvider
 import com.example.alertawear.data.RealLocationAlertGateway
 import com.example.alertawear.data.RealWatchConnectionMonitor
@@ -29,7 +30,8 @@ class MainActivity : ComponentActivity() {
         val appContext = applicationContext
         val storage = SharedPrefsAlertStorage(appContext)
         val locationProvider = FusedPhoneLocationProvider(appContext)
-        val gateway = RealLocationAlertGateway(locationProvider)
+        val smsSender = AndroidPhoneSmsSender(appContext)
+        val gateway = RealLocationAlertGateway(locationProvider, smsSender)
         val watchMonitor = RealWatchConnectionMonitor(appContext)
 
         setContent {
@@ -39,23 +41,23 @@ class MainActivity : ComponentActivity() {
                         storage = storage,
                         gateway = gateway,
                         watchConnectionMonitor = watchMonitor,
-                        locationProvider = locationProvider
+                        locationProvider = locationProvider,
+                        smsSender = smsSender
                     )
                 )
                 val uiState by viewModel.uiState.collectAsState()
 
                 val permissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
-                ) { permissions ->
-                    val granted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-                        permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-                    viewModel.onLocationPermissionResult(granted)
+                ) {
+                    viewModel.onPermissionsResult()
                 }
 
                 val requestPermissionsAction = {
                     val perms = buildList {
                         add(Manifest.permission.ACCESS_FINE_LOCATION)
                         add(Manifest.permission.ACCESS_COARSE_LOCATION)
+                        add(Manifest.permission.SEND_SMS)
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                             add(Manifest.permission.POST_NOTIFICATIONS)
                         }
@@ -63,9 +65,9 @@ class MainActivity : ComponentActivity() {
                     permissionLauncher.launch(perms)
                 }
 
-                // Solicitar permisos de ubicación y notificaciones al iniciar si no se han concedido
+                // Solicitar permisos de ubicación, SMS y notificaciones al iniciar si faltan
                 LaunchedEffect(Unit) {
-                    if (!locationProvider.hasForegroundLocationPermission()) {
+                    if (!locationProvider.hasForegroundLocationPermission() || !smsSender.hasSendSmsPermission()) {
                         requestPermissionsAction()
                     }
                 }
@@ -74,7 +76,7 @@ class MainActivity : ComponentActivity() {
                     uiState = uiState,
                     onNavigate = viewModel::navigateTo,
                     onRefreshStatus = viewModel::refreshDeviceAndLocationStatus,
-                    onRequestLocationPermission = requestPermissionsAction,
+                    onRequestPermissions = requestPermissionsAction,
                     onDraftNameChange = viewModel::onDraftNameChanged,
                     onDraftPhoneChange = viewModel::onDraftPhoneChanged,
                     onSaveContact = viewModel::saveContact,

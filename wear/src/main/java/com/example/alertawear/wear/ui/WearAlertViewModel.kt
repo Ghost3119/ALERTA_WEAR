@@ -202,32 +202,58 @@ class WearAlertViewModel(
                         inProgressTitle = "Solicitud recibida",
                         inProgressSubtitle = "Revisa el celular",
                         statusDetailMessage = "Preparando ubicación...",
-                        footerMessage = "Sin envío a contacto"
+                        footerMessage = "No cierres la app"
                     )
                 }
             }
 
+            "SENDING_SMS_WITH_LOCATION",
             "PREPARED_WITH_LOCATION" -> {
                 _uiState.update {
                     it.copy(
                         currentScreen = WearScreen.IN_PROGRESS,
-                        inProgressTitle = "Aviso preparado",
-                        inProgressSubtitle = "Ubicación lista en celular",
-                        statusDetailMessage = "Preparado (Sin envío)",
-                        footerMessage = "Toca para volver"
+                        inProgressTitle = "Enviando SMS",
+                        inProgressSubtitle = "Ubicación incluida",
+                        statusDetailMessage = "Transmitiendo aviso...",
+                        footerMessage = "Espera confirmación"
                     )
                 }
             }
 
+            "SENDING_SMS_NO_LOCATION",
             "PREPARED_NO_LOCATION_PERM",
             "PREPARED_GPS_DISABLED",
             "PREPARED_LOCATION_UNAVAILABLE" -> {
                 _uiState.update {
                     it.copy(
                         currentScreen = WearScreen.IN_PROGRESS,
-                        inProgressTitle = "Aviso preparado",
-                        inProgressSubtitle = "Revisa el celular",
-                        statusDetailMessage = "Sin ubicación disponible",
+                        inProgressTitle = "Enviando SMS",
+                        inProgressSubtitle = "Sin ubicación disponible",
+                        statusDetailMessage = "Transmitiendo aviso...",
+                        footerMessage = "Espera confirmación"
+                    )
+                }
+            }
+
+            "SMS_SENT_BY_DEVICE" -> {
+                _uiState.update {
+                    it.copy(
+                        currentScreen = WearScreen.IN_PROGRESS,
+                        inProgressTitle = "SMS enviado",
+                        inProgressSubtitle = "Por el dispositivo",
+                        statusDetailMessage = "Entrega sin confirmar",
+                        footerMessage = "Toca para volver"
+                    )
+                }
+            }
+
+            "SMS_DELIVERED" -> {
+                _uiState.update {
+                    it.copy(
+                        currentScreen = WearScreen.IN_PROGRESS,
+                        inProgressTitle = "SMS entregado",
+                        inProgressSubtitle = "Confirmado por red",
+                        statusDetailMessage = "Entregado al contacto",
                         footerMessage = "Toca para volver"
                     )
                 }
@@ -239,7 +265,31 @@ class WearAlertViewModel(
                         currentScreen = WearScreen.IN_PROGRESS,
                         inProgressTitle = "Falta contacto",
                         inProgressSubtitle = "Configúralo en el celular",
-                        statusDetailMessage = "Solicitud recibida",
+                        statusDetailMessage = "No se envió SMS",
+                        footerMessage = "Toca para volver"
+                    )
+                }
+            }
+
+            "ERROR_NO_SMS_PERM" -> {
+                _uiState.update {
+                    it.copy(
+                        currentScreen = WearScreen.IN_PROGRESS,
+                        inProgressTitle = "Permiso SMS",
+                        inProgressSubtitle = "Denegado en el celular",
+                        statusDetailMessage = "Autoriza SEND_SMS",
+                        footerMessage = "Toca para volver"
+                    )
+                }
+            }
+
+            "ERROR_SMS_FAILED" -> {
+                _uiState.update {
+                    it.copy(
+                        currentScreen = WearScreen.IN_PROGRESS,
+                        inProgressTitle = "Error de envío",
+                        inProgressSubtitle = "Revisa SIM o señal",
+                        statusDetailMessage = "Fallo al enviar SMS",
                         footerMessage = "Toca para volver"
                     )
                 }

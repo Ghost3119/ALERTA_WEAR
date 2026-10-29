@@ -18,8 +18,9 @@ import com.google.android.gms.wearable.WearableListenerService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
 import org.json.JSONObject
 
@@ -67,11 +68,13 @@ class RealWatchConnectionMonitor(
 }
 
 /**
- * Coordinador en el teléfono que procesa una solicitud SOS entrante desde el reloj:
- * 1. Envía confirmación inmediata ("RECEIVED_PREPARING") al reloj.
- * 2. Registra/actualiza el evento en el historial local deduplicado por `requestId`.
- * 3. Intenta obtener la ubicación con [AlertPreparationGateway].
- * 4. Actualiza el evento en el historial local y envía el resultado final al reloj.
+ * Coordinador en el teléfono que procesa una solicitud SOS entrante desde el reloj (Fase 3):
+ * 1. Verifica si el `requestId` ya fue enviado o está en proceso de envío de SMS para evitar
+ *    envíos duplicados ante reintentos.
+ * 2. Envía confirmación inmediata ("RECEIVED_PREPARING") al reloj.
+ * 3. Obtiene la ubicación y dispara el envío real por `SmsManager` a través de [AlertPreparationGateway].
+ * 4. Devuelve el estado resultante al reloj (y posteriormente [SmsStatusBroadcastReceiver] notificará
+ *    cuando el sistema confirme `SENT_BY_DEVICE` o `DELIVERED`).
  */
 class PhoneSosRequestProcessor(
     private val storage: LocalAlertStorage,
@@ -82,61 +85,114 @@ class PhoneSosRequestProcessor(
         sourceNodeId: String,
         requestId: String,
         isAppInForeground: Boolean
-    ): AlertHistoryEvent {
-        // 1. Confirmar recepción inmediata de la solicitud al reloj
+    ): AlertHistoryEvent = PROCESS_MUTEX.withLock {
+        // 1. Evitar envío duplicado si este requestId ya inició o completó el envío de SMS
+        val existing = storage.findEventByRequestId(requestId)
+        if (existing != null && existing.status in listOf(
+                AlertStatus.SENDING_SMS,
+                AlertStatus.SENT_BY_DEVICE,
+                AlertStatus.DELIVERED
+            )
+        ) {
+            val existingAck = when (existing.status) {
+                AlertStatus.DELIVERED -> RealLocationAlertGateway.ACK_SMS_DELIVERED
+                AlertStatus.SENT_BY_DEVICE -> RealLocationAlertGateway.ACK_SMS_SENT_BY_DEVICE
+                else -> RealLocationAlertGateway.ACK_SENDING_SMS_WITH_LOCATION
+            }
+            ackSender(sourceNodeId, requestId, existingAck, existing.smsStatusNote.ifBlank { existing.locationNote })
+            return existing
+        }
+
+        // 2. Confirmar recepción inmediata de la solicitud al reloj
         ackSender(
             sourceNodeId,
             requestId,
             RealLocationAlertGateway.ACK_RECEIVED_PREPARING,
-            "Solicitud recibida en el teléfono. Buscando ubicación..."
+            "Solicitud recibida en el teléfono. Preparando ubicación y SMS..."
         )
 
         val initialEvent = AlertHistoryEvent(
-            id = "evt_$requestId",
+            id = existing?.id ?: "evt_$requestId",
             requestId = requestId,
-            title = "Solicitud SOS recibida desde reloj",
+            sourceNodeId = sourceNodeId,
+            title = "Solicitud SOS desde reloj",
             timestampLabel = SharedPrefsAlertStorage.formatCurrentTimestamp(),
-            status = AlertStatus.PENDING,
+            status = AlertStatus.PREPARING_LOCATION,
             origin = AlertOrigin.WATCH_DATA_LAYER,
             locationNote = "Buscando ubicación en el teléfono...",
+            smsStatusNote = "Preparando mensaje SMS de prueba...",
             isSimulated = false
         )
         storage.upsertHistoryEventByRequestId(initialEvent)
 
-        // 2. Intentar obtener ubicación y preparar aviso
+        // 3. Intentar obtener ubicación y disparar envío de SMS
         val contact = storage.loadContact()
-        val result = gateway.prepareAlert(
+        val result = gateway.prepareAndSendAlert(
+            requestId = requestId,
+            sourceNodeId = sourceNodeId,
             contact = contact,
             origin = AlertOrigin.WATCH_DATA_LAYER,
             isAppInForeground = isAppInForeground
         )
 
+        // Consultar de nuevo por si SmsStatusBroadcastReceiver ya actualizó a SENT_BY_DEVICE o DELIVERED de forma síncrona/rápida
+        val latestStored = storage.findEventByRequestId(requestId)
+        val effectiveStatus = if (latestStored != null && latestStored.status in listOf(
+                AlertStatus.SENT_BY_DEVICE,
+                AlertStatus.DELIVERED
+            )
+        ) {
+            latestStored.status
+        } else {
+            result.status
+        }
+
+        val effectiveSmsNote = if (latestStored != null && latestStored.status in listOf(
+                AlertStatus.SENT_BY_DEVICE,
+                AlertStatus.DELIVERED
+            )
+        ) {
+            latestStored.smsStatusNote
+        } else {
+            result.smsStatusSummary
+        }
+
         val finalEvent = initialEvent.copy(
-            title = if (result.status == AlertStatus.PREPARED) {
-                "Solicitud SOS desde reloj"
-            } else {
+            title = if (contact == null || !contact.isValid) {
                 "Solicitud SOS desde reloj (Sin contacto)"
+            } else {
+                "Solicitud SOS desde reloj"
             },
-            status = result.status,
-            locationNote = result.locationSummary
+            status = effectiveStatus,
+            locationNote = result.locationSummary,
+            smsStatusNote = effectiveSmsNote
         )
         storage.upsertHistoryEventByRequestId(finalEvent)
 
-        // 3. Devolver resultado real de la preparación al reloj
+        val ackToSend = when (effectiveStatus) {
+            AlertStatus.DELIVERED -> RealLocationAlertGateway.ACK_SMS_DELIVERED
+            AlertStatus.SENT_BY_DEVICE -> RealLocationAlertGateway.ACK_SMS_SENT_BY_DEVICE
+            else -> result.watchAckStatus
+        }
+
+        // 4. Devolver estado actual al reloj
         ackSender(
             sourceNodeId,
             requestId,
-            result.watchAckStatus,
-            result.locationSummary
+            ackToSend,
+            effectiveSmsNote
         )
 
         return finalEvent
     }
+
+    companion object {
+        private val PROCESS_MUTEX = Mutex()
+    }
 }
 
 /**
- * Servicio de Google Play Services Wearable que despierta la aplicación del teléfono cuando
- * llega un mensaje por Data Layer (`MessageClient`), incluso si la UI de la app está cerrada.
+ * Servicio de Google Play Services Wearable que recibe la solicitud SOS del reloj.
  */
 class PhoneWearableListenerService : WearableListenerService() {
 
@@ -150,7 +206,8 @@ class PhoneWearableListenerService : WearableListenerService() {
 
             val storage = SharedPrefsAlertStorage(appCtx)
             val locationProvider = FusedPhoneLocationProvider(appCtx)
-            val gateway = RealLocationAlertGateway(locationProvider)
+            val smsSender = AndroidPhoneSmsSender(appCtx)
+            val gateway = RealLocationAlertGateway(locationProvider, smsSender)
 
             val processor = PhoneSosRequestProcessor(
                 storage = storage,
@@ -165,7 +222,6 @@ class PhoneWearableListenerService : WearableListenerService() {
                 showIncomingSosNotification(requestId)
             }
 
-            // Usar un scope que no se cancele cuando WearableListenerService destruya la instancia tras retornar onMessageReceived
             APP_BACKGROUND_SCOPE.launch {
                 processor.processIncomingSos(
                     sourceNodeId = sourceNodeId,
@@ -238,7 +294,7 @@ class PhoneWearableListenerService : WearableListenerService() {
         val notification = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setContentTitle("Solicitud SOS desde tu reloj")
-            .setContentText("Toca para abrir Alerta Wear y preparar ubicación.")
+            .setContentText("Procesando alerta SMS de prueba. Toca para abrir Alerta Wear.")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)

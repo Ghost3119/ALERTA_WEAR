@@ -75,7 +75,7 @@ fun AlertaWearMobileApp(
     uiState: MobileUiState,
     onNavigate: (MobileScreen) -> Unit,
     onRefreshStatus: () -> Unit,
-    onRequestLocationPermission: () -> Unit,
+    onRequestPermissions: () -> Unit,
     onDraftNameChange: (String) -> Unit,
     onDraftPhoneChange: (String) -> Unit,
     onSaveContact: () -> Unit,
@@ -102,7 +102,7 @@ fun AlertaWearMobileApp(
                 MobileScreen.HOME -> MobileHomeScreen(
                     uiState = uiState,
                     onRefreshStatus = onRefreshStatus,
-                    onRequestLocationPermission = onRequestLocationPermission,
+                    onRequestPermissions = onRequestPermissions,
                     onSosLongPressed = onSosLongPressed,
                     onCancelCountdown = onCancelCountdown,
                     onOpenContact = { onNavigate(MobileScreen.CONTACT) }
@@ -112,19 +112,20 @@ fun AlertaWearMobileApp(
                     uiState = uiState,
                     onDraftNameChange = onDraftNameChange,
                     onDraftPhoneChange = onDraftPhoneChange,
-                    onSaveContact = onSaveContact
+                    onSaveContact = onSaveContact,
+                    onRequestPermissions = onRequestPermissions
                 )
 
                 MobileScreen.ALERT_IN_PROGRESS -> MobileAlertInProgressScreen(
                     uiState = uiState,
                     onCancelActiveAlert = onCancelActiveAlert,
-                    onRequestLocationPermission = onRequestLocationPermission,
+                    onRequestPermissions = onRequestPermissions,
                     onOpenContact = { onNavigate(MobileScreen.CONTACT) }
                 )
 
                 MobileScreen.HISTORY -> MobileHistoryScreen(
                     uiState = uiState,
-                    onRequestLocationPermission = onRequestLocationPermission
+                    onRequestPermissions = onRequestPermissions
                 )
             }
         }
@@ -146,7 +147,7 @@ private fun AppHeaderBrand() {
 fun MobileHomeScreen(
     uiState: MobileUiState,
     onRefreshStatus: () -> Unit,
-    onRequestLocationPermission: () -> Unit,
+    onRequestPermissions: () -> Unit,
     onSosLongPressed: () -> Unit,
     onCancelCountdown: () -> Unit,
     onOpenContact: () -> Unit
@@ -218,7 +219,7 @@ fun MobileHomeScreen(
                         modifier = Modifier.padding(20.dp)
                     ) {
                         Text(
-                            text = "Preparando alerta en",
+                            text = "Enviando alerta SMS de prueba en",
                             color = AlertaTextSecondary,
                             fontSize = 13.sp
                         )
@@ -303,7 +304,7 @@ fun MobileHomeScreen(
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // Estado de permiso de ubicación para que el teléfono pueda obtener coordenadas al recibir SOS
+        // Tarjeta de estado de Permisos (Ubicación y SMS)
         Surface(
             color = AlertaSurface,
             shape = RoundedCornerShape(18.dp),
@@ -318,30 +319,23 @@ fun MobileHomeScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Ubicación del teléfono",
+                        text = "Permisos de Ubicación y SMS",
                         color = AlertaTextPrimary,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(4.dp))
-                    val locText = when {
-                        !uiState.hasLocationPermission -> "Permiso pendiente de conceder"
-                        !uiState.isLocationServicesEnabled -> "GPS desactivado en ajustes"
-                        else -> "Permiso activo y GPS habilitado"
-                    }
-                    val locColor = if (uiState.hasLocationPermission && uiState.isLocationServicesEnabled) {
-                        AlertaStatusGreen
-                    } else {
-                        AlertaStatusAmber
-                    }
+                    val locStatus = if (uiState.hasLocationPermission) "Ubicación: OK" else "Ubicación: Pendiente"
+                    val smsStatus = if (uiState.hasSendSmsPermission) "SMS: OK" else "SMS: Pendiente"
+                    val allReady = uiState.hasLocationPermission && uiState.hasSendSmsPermission
                     Text(
-                        text = locText,
-                        color = locColor,
+                        text = "$locStatus · $smsStatus",
+                        color = if (allReady) AlertaStatusGreen else AlertaStatusAmber,
                         fontSize = 12.sp
                     )
                 }
-                if (!uiState.hasLocationPermission) {
-                    TextButton(onClick = onRequestLocationPermission) {
+                if (!uiState.hasLocationPermission || !uiState.hasSendSmsPermission) {
+                    TextButton(onClick = onRequestPermissions) {
                         Text(
                             text = "Permitir",
                             color = AlertaCoral,
@@ -440,7 +434,8 @@ fun MobileContactScreen(
     uiState: MobileUiState,
     onDraftNameChange: (String) -> Unit,
     onDraftPhoneChange: (String) -> Unit,
-    onSaveContact: () -> Unit
+    onSaveContact: () -> Unit,
+    onRequestPermissions: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -532,7 +527,12 @@ fun MobileContactScreen(
         Spacer(modifier = Modifier.height(32.dp))
 
         Button(
-            onClick = onSaveContact,
+            onClick = {
+                onSaveContact()
+                if (!uiState.hasSendSmsPermission) {
+                    onRequestPermissions()
+                }
+            },
             colors = ButtonDefaults.buttonColors(
                 containerColor = AlertaCoral,
                 contentColor = AlertaBackground
@@ -572,7 +572,7 @@ fun MobileContactScreen(
 fun MobileAlertInProgressScreen(
     uiState: MobileUiState,
     onCancelActiveAlert: () -> Unit,
-    onRequestLocationPermission: () -> Unit,
+    onRequestPermissions: () -> Unit,
     onOpenContact: () -> Unit
 ) {
     Column(
@@ -598,7 +598,7 @@ fun MobileAlertInProgressScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // Tarjeta superior de preparación (#44282D)
+        // Tarjeta superior de preparación y estado general (#44282D)
         Surface(
             color = AlertaActiveSurface,
             shape = RoundedCornerShape(18.dp),
@@ -608,10 +608,13 @@ fun MobileAlertInProgressScreen(
                 modifier = Modifier.padding(horizontal = 18.dp, vertical = 20.dp)
             ) {
                 val headerText = when (uiState.activeAlertStatus) {
-                    AlertStatus.PENDING -> "Preparando aviso"
-                    AlertStatus.PREPARED -> "Solicitud recibida · Aviso preparado"
+                    AlertStatus.RECEIVED -> "Solicitud recibida"
+                    AlertStatus.PREPARING_LOCATION -> "Preparando aviso"
+                    AlertStatus.SENDING_SMS -> "Enviando SMS de prueba..."
+                    AlertStatus.SENT_BY_DEVICE -> "SMS enviado por el dispositivo"
+                    AlertStatus.DELIVERED -> "SMS entregado al destinatario"
                     AlertStatus.CANCELLED -> "Alerta cancelada"
-                    AlertStatus.ERROR -> "Error en la preparación"
+                    AlertStatus.ERROR -> "Error en el envío"
                 }
                 Text(
                     text = headerText,
@@ -629,11 +632,11 @@ fun MobileAlertInProgressScreen(
                     },
                     fontSize = 13.sp
                 )
-                if (!uiState.hasLocationPermission) {
+                if (!uiState.hasLocationPermission || !uiState.hasSendSmsPermission) {
                     Spacer(modifier = Modifier.height(8.dp))
-                    TextButton(onClick = onRequestLocationPermission) {
+                    TextButton(onClick = onRequestPermissions) {
                         Text(
-                            text = "Conceder permiso de ubicación",
+                            text = "Conceder permisos faltantes (Ubicación / SMS)",
                             color = AlertaCoral,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold
@@ -645,7 +648,7 @@ fun MobileAlertInProgressScreen(
 
         Spacer(modifier = Modifier.height(20.dp))
 
-        // Tarjeta de Contacto de confianza y estado del envío
+        // Tarjeta de Contacto de confianza y estado real del envío SMS
         Surface(
             color = AlertaSurface,
             shape = RoundedCornerShape(18.dp),
@@ -668,7 +671,7 @@ fun MobileAlertInProgressScreen(
                         color = AlertaTextPrimary,
                         fontSize = 13.sp
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
                 } else {
                     Text(
                         text = "Sin contacto configurado (toca para configurar)",
@@ -676,11 +679,16 @@ fun MobileAlertInProgressScreen(
                         fontSize = 12.sp,
                         modifier = Modifier.clickable(onClick = onOpenContact)
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
+                val smsColor = when (uiState.activeAlertStatus) {
+                    AlertStatus.DELIVERED, AlertStatus.SENT_BY_DEVICE -> AlertaStatusGreen
+                    AlertStatus.ERROR -> AlertaStatusError
+                    else -> AlertaTextSecondary
                 }
                 Text(
-                    text = "Envío pendiente de confirmación (Fase 2: sin envío externo)",
-                    color = AlertaTextSecondary,
+                    text = uiState.activeSmsStatusText,
+                    color = smsColor,
                     fontSize = 12.sp
                 )
             }
@@ -697,6 +705,10 @@ fun MobileAlertInProgressScreen(
 
         Spacer(modifier = Modifier.height(28.dp))
 
+        val isAlreadySent = uiState.activeAlertStatus in listOf(
+            AlertStatus.SENT_BY_DEVICE,
+            AlertStatus.DELIVERED
+        )
         Button(
             onClick = onCancelActiveAlert,
             colors = ButtonDefaults.buttonColors(
@@ -709,7 +721,7 @@ fun MobileAlertInProgressScreen(
                 .height(54.dp)
         ) {
             Text(
-                text = "Cancelar alerta",
+                text = if (isAlreadySent) "Ver en Historial" else "Cancelar alerta",
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Bold
             )
@@ -720,7 +732,7 @@ fun MobileAlertInProgressScreen(
 @Composable
 fun MobileHistoryScreen(
     uiState: MobileUiState,
-    onRequestLocationPermission: () -> Unit
+    onRequestPermissions: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -764,7 +776,7 @@ fun MobileHistoryScreen(
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "Cuando inicies una alerta desde el reloj o el teléfono, aparecerá aquí con el resultado de ubicación.",
+                        text = "Cuando inicies una alerta desde el reloj o el teléfono, aparecerá aquí con el estado real del SMS y la ubicación.",
                         color = AlertaTextSecondary,
                         fontSize = 12.sp
                     )
@@ -800,10 +812,18 @@ fun MobileHistoryScreen(
                             color = AlertaTextSecondary,
                             fontSize = 12.sp
                         )
+                        if (event.smsStatusNote.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = event.smsStatusNote,
+                                color = AlertaTextSecondary,
+                                fontSize = 12.sp
+                            )
+                        }
                         Spacer(modifier = Modifier.height(10.dp))
                         val badgeColor = when (event.status) {
-                            AlertStatus.PENDING -> AlertaStatusAmber
-                            AlertStatus.PREPARED -> AlertaStatusAmber
+                            AlertStatus.DELIVERED, AlertStatus.SENT_BY_DEVICE -> AlertaStatusGreen
+                            AlertStatus.RECEIVED, AlertStatus.PREPARING_LOCATION, AlertStatus.SENDING_SMS -> AlertaStatusAmber
                             AlertStatus.CANCELLED -> AlertaTextSecondary
                             AlertStatus.ERROR -> AlertaStatusError
                         }
@@ -837,15 +857,15 @@ fun MobileHistoryScreen(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Se incluye si está disponible",
+                    text = "Se incluye un enlace a Google Maps si está disponible",
                     color = AlertaTextSecondary,
                     fontSize = 12.sp
                 )
-                if (!uiState.hasLocationPermission) {
+                if (!uiState.hasLocationPermission || !uiState.hasSendSmsPermission) {
                     Spacer(modifier = Modifier.height(8.dp))
-                    TextButton(onClick = onRequestLocationPermission) {
+                    TextButton(onClick = onRequestPermissions) {
                         Text(
-                            text = "Conceder permiso de ubicación",
+                            text = "Conceder permisos de Ubicación / SMS",
                             color = AlertaCoral,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold
@@ -913,11 +933,13 @@ fun MobileHomeScreenPreview() {
                 ),
                 hasLocationPermission = true,
                 isLocationServicesEnabled = true,
+                hasSendSmsPermission = true,
+                canDeviceSendSms = true,
                 trustedContact = TrustedContact("María", "+52 844 000 0000")
             ),
             onNavigate = {},
             onRefreshStatus = {},
-            onRequestLocationPermission = {},
+            onRequestPermissions = {},
             onDraftNameChange = {},
             onDraftPhoneChange = {},
             onSaveContact = {},
