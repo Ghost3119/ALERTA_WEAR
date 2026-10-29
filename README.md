@@ -27,6 +27,18 @@ Proyecto académico para la materia **Desarrollo de Dispositivos Inteligentes**.
 - **Prevención de envíos duplicados:** Deduplica solicitudes por `requestId` para que un reintento desde el reloj no dispare múltiples SMS para la misma alerta.
 - **Historial local de eventos:** Conserva la bitácora local de alertas preparadas, enviadas, canceladas o con error.
 
+### Diseño visual, temas e identidad (v2 · Tema claro e icono)
+- **Tema claro en móvil y reloj (con tema oscuro conservado):**
+  - En **móvil (`:app`)**, utiliza superficies claras (`#F7F8FA` y tarjetas `#FFFFFF` con borde `#E6E8EE`), manteniendo el botón **SOS en rojo coral** (`#D7474B`) con icono de escudo de alerta y halo suave (`#FCECEE`), insignia **`PRUEBA`** en el encabezado y colores semánticos diferenciados para conexión/entrega confirmada (`#24765A`), información/enviado sin confirmar (`#42628F`), advertencia/preparación (`#92611C`) y error (`#B82F37`).
+  - En **Wear OS (`:wear`)**, utiliza fondo circular blanco sólido (`#FFFFFF`) sin desenfoques para máxima legibilidad en pantalla pequeña, botón SOS rojo con escudo y píldoras de acción redondeadas.
+  - El **tema oscuro** original se conserva íntegro en ambos módulos (`DarkAlertaColorPalette` en `Theme.kt` y `DarkWearColorPalette` en `WearScreens.kt`, activables mediante el parámetro `darkTheme = true`).
+- **Navegación flotante tipo cristal en móvil (`Inicio`, `Contacto`, `Historial`):**
+  - Sustituye la barra inferior fija por una cápsula flotante con las tres secciones principales (**Inicio**, **Contacto** e **Historial**), respetando márgenes del sistema (`statusBarsPadding`, `navigationBarsPadding`), teclado en pantalla (`imePadding`) y desplazamiento inferior del contenido.
+  - Emplea una superficie blanca casi opaca (`93 %`) con borde suave y sombra difusa para que el efecto afecte únicamente al contenedor sobre el fondo y **nunca desenfoque los iconos ni las etiquetas**.
+  - La ruta **Alerta iniciada** (`MobileScreen.ALERT_IN_PROGRESS`) se mantiene como pantalla de flujo automático cuando se activa un SOS desde el reloj o el teléfono (con acceso rápido mediante un aviso superior si el usuario cambia de pestaña mientras una alerta sigue en curso).
+- **Icono de aplicación adaptativo, circular y monocromático:**
+  - Integrado con vectores editables en ambos módulos (`:app` y `:wear`), incluyendo capa de fondo (`#D7474B`), escudo blanco con signo de alerta (`ic_launcher_foreground`), variante circular (`ic_launcher_round`), capa monocromática (`ic_launcher_monochrome`) para iconos temáticos de Android 13+ e icono monocromático de notificación (`ic_stat_shield_alert`).
+
 ---
 
 ## 2. Tecnologías, módulos y requisitos del proyecto
@@ -43,8 +55,8 @@ Proyecto académico para la materia **Desarrollo de Dispositivos Inteligentes**.
 | **Android Gradle Plugin (AGP)** | `9.3.3` |
 | **Gradle Wrapper** | `9.5.0` |
 | **SDK de compilación (`compileSdk`)** | `37` |
-| **SDK objetivo (`targetSdk`)** | `37` (`:app`) / `35` (`:wear`) |
-| **SDK mínimo (`minSdk`)** | `26` (Android 8.0 en `:app`) / `30` (Wear OS 3.0 en `:wear`) |
+| **SDK objetivo (`targetSdk`)** | `37` (`:app` y `:wear`) |
+| **SDK mínimo (`minSdk`)** | `24` (Android 7.0 en `:app`) / `30` (Wear OS 3.0 en `:wear`) |
 | **UI Móvil** | Jetpack Compose (BOM `2025.02.00`) + Material 3 |
 | **UI Reloj** | Compose for Wear OS (`androidx.wear.compose:compose-material:1.4.1`) |
 | **Comunicación Reloj ↔ Teléfono** | Google Play Services Wearable (`play-services-wearable:19.0.0`) |
@@ -130,9 +142,9 @@ Para que Wear OS Data Layer transmita las solicitudes SOS entre `:wear` y `:app`
 
 1. **Permisos en el teléfono:**
    - Al abrir la aplicación móvil por primera vez, Android solicitará permisos de **Ubicación** (`ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION`), **Envío de SMS** (`SEND_SMS`) y **Notificaciones** (`POST_NOTIFICATIONS` en Android 13+).
-   - Si alguno fue rechazado inicialmente, en las pantallas **Inicio** y **Contacto** aparecen botones directos (**Autorizar ubicación** / **Autorizar permiso de SMS**) para volver a solicitarlos.
+   - Si alguno fue rechazado inicialmente, en las pantallas **Inicio**, **Alerta iniciada** e **Historial** aparece una acción directa (**Permitir** / **Conceder permisos**) para volver a solicitarlos.
 2. **Configurar el contacto:**
-   - En la barra de navegación inferior del teléfono, entra a **Contacto**.
+   - En la barra de navegación flotante inferior del teléfono, entra a **Contacto**.
    - Escribe el **nombre** y el **número telefónico** del contacto de confianza.
    - Pulsa **Guardar contacto**. El contacto queda almacenado localmente en el teléfono.
 

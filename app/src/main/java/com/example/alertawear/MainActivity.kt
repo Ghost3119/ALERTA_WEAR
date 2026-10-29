@@ -1,13 +1,16 @@
 package com.example.alertawear
 
 import android.Manifest
+import android.graphics.Color as AndroidColor
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -26,7 +29,9 @@ import com.example.alertawear.ui.theme.AlertaWearTheme
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        val useDarkTheme = false
+        applySystemBarsForTheme(useDarkTheme)
+
         val appContext = applicationContext
         val storage = SharedPrefsAlertStorage(appContext)
         val locationProvider = FusedPhoneLocationProvider(appContext)
@@ -35,7 +40,12 @@ class MainActivity : ComponentActivity() {
         val watchMonitor = RealWatchConnectionMonitor(appContext)
 
         setContent {
-            AlertaWearTheme {
+            DisposableEffect(useDarkTheme) {
+                applySystemBarsForTheme(useDarkTheme)
+                onDispose {}
+            }
+
+            AlertaWearTheme(darkTheme = useDarkTheme) {
                 val viewModel: MobileAlertViewModel = viewModel(
                     factory = MobileAlertViewModel.Factory(
                         storage = storage,
@@ -87,6 +97,26 @@ class MainActivity : ComponentActivity() {
                     onCancelActiveAlert = viewModel::cancelActiveAlert
                 )
             }
+        }
+    }
+
+    private fun applySystemBarsForTheme(isDark: Boolean) {
+        if (isDark) {
+            enableEdgeToEdge(
+                statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+                navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+            )
+        } else {
+            enableEdgeToEdge(
+                statusBarStyle = SystemBarStyle.light(
+                    AndroidColor.TRANSPARENT,
+                    AndroidColor.TRANSPARENT
+                ),
+                navigationBarStyle = SystemBarStyle.light(
+                    AndroidColor.TRANSPARENT,
+                    AndroidColor.TRANSPARENT
+                )
+            )
         }
     }
 

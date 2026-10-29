@@ -8,6 +8,7 @@ import android.content.Intent
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import com.example.alertawear.MainActivity
+import com.example.alertawear.R
 import com.example.alertawear.model.AlertHistoryEvent
 import com.example.alertawear.model.AlertOrigin
 import com.example.alertawear.model.AlertStatus
@@ -326,7 +327,7 @@ class PhoneWearableListenerService : WearableListenerService() {
         )
 
         val notification = NotificationCompat.Builder(this, channelId)
-            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setSmallIcon(R.drawable.ic_stat_shield_alert)
             .setContentTitle("Solicitud SOS desde tu reloj")
             .setContentText("Procesando alerta SMS de prueba. Toca para abrir Alerta Wear.")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
