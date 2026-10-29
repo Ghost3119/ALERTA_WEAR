@@ -3,7 +3,6 @@ package com.example.alertawear.ui.screens
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -54,10 +53,9 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.alertawear.R
-import com.example.alertawear.data.SharedPrefsAlertStorage
-import com.example.alertawear.model.AlertOrigin
 import com.example.alertawear.model.AlertStatus
 import com.example.alertawear.model.TrustedContact
+import com.example.alertawear.model.WatchConnectionState
 import com.example.alertawear.ui.MobileScreen
 import com.example.alertawear.ui.MobileUiState
 import com.example.alertawear.ui.theme.AlertaActiveSurface
@@ -76,14 +74,13 @@ import kotlinx.coroutines.delay
 fun AlertaWearMobileApp(
     uiState: MobileUiState,
     onNavigate: (MobileScreen) -> Unit,
+    onRefreshStatus: () -> Unit,
+    onRequestLocationPermission: () -> Unit,
     onDraftNameChange: (String) -> Unit,
     onDraftPhoneChange: (String) -> Unit,
     onSaveContact: () -> Unit,
-    onFillSampleContact: () -> Unit,
     onSosLongPressed: () -> Unit,
     onCancelCountdown: () -> Unit,
-    onSimulateWatchAlert: () -> Unit,
-    onSimulateErrorAlert: () -> Unit,
     onCancelActiveAlert: () -> Unit
 ) {
     Scaffold(
@@ -104,30 +101,30 @@ fun AlertaWearMobileApp(
             when (uiState.currentScreen) {
                 MobileScreen.HOME -> MobileHomeScreen(
                     uiState = uiState,
+                    onRefreshStatus = onRefreshStatus,
+                    onRequestLocationPermission = onRequestLocationPermission,
                     onSosLongPressed = onSosLongPressed,
                     onCancelCountdown = onCancelCountdown,
-                    onOpenContact = { onNavigate(MobileScreen.CONTACT) },
-                    onSimulateWatchAlert = onSimulateWatchAlert
+                    onOpenContact = { onNavigate(MobileScreen.CONTACT) }
                 )
 
                 MobileScreen.CONTACT -> MobileContactScreen(
                     uiState = uiState,
                     onDraftNameChange = onDraftNameChange,
                     onDraftPhoneChange = onDraftPhoneChange,
-                    onSaveContact = onSaveContact,
-                    onFillSampleContact = onFillSampleContact
+                    onSaveContact = onSaveContact
                 )
 
                 MobileScreen.ALERT_IN_PROGRESS -> MobileAlertInProgressScreen(
                     uiState = uiState,
                     onCancelActiveAlert = onCancelActiveAlert,
-                    onSimulateErrorAlert = onSimulateErrorAlert,
+                    onRequestLocationPermission = onRequestLocationPermission,
                     onOpenContact = { onNavigate(MobileScreen.CONTACT) }
                 )
 
                 MobileScreen.HISTORY -> MobileHistoryScreen(
                     uiState = uiState,
-                    onSimulateWatchAlert = onSimulateWatchAlert
+                    onRequestLocationPermission = onRequestLocationPermission
                 )
             }
         }
@@ -148,10 +145,11 @@ private fun AppHeaderBrand() {
 @Composable
 fun MobileHomeScreen(
     uiState: MobileUiState,
+    onRefreshStatus: () -> Unit,
+    onRequestLocationPermission: () -> Unit,
     onSosLongPressed: () -> Unit,
     onCancelCountdown: () -> Unit,
-    onOpenContact: () -> Unit,
-    onSimulateWatchAlert: () -> Unit
+    onOpenContact: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -170,29 +168,32 @@ fun MobileHomeScreen(
         )
         Spacer(modifier = Modifier.height(24.dp))
 
-        // Tarjeta de estado del reloj: NO afirma que el reloj está conectado si no se ha comprobado
+        // Tarjeta de estado real del reloj vía Wear OS Data Layer (NodeClient)
         Surface(
             color = AlertaSurface,
             shape = RoundedCornerShape(18.dp),
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(18.dp))
+                .clickable(onClick = onRefreshStatus)
         ) {
             Column(
                 modifier = Modifier.padding(horizontal = 18.dp, vertical = 16.dp)
             ) {
-                val statusColor = if (uiState.watchConnectionStatus.isConnected) {
-                    AlertaStatusGreen
-                } else {
-                    AlertaStatusAmber
+                val statusColor = when {
+                    uiState.watchConnection.isChecking -> AlertaStatusAmber
+                    uiState.watchConnection.isConnected -> AlertaStatusGreen
+                    else -> AlertaCoral
                 }
                 Text(
-                    text = "●  ${uiState.watchConnectionStatus.title}",
+                    text = "●  ${uiState.watchConnection.title}",
                     color = statusColor,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Bold
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = uiState.watchConnectionStatus.subtitle,
+                    text = "${uiState.watchConnection.subtitle} (Toca para actualizar)",
                     color = AlertaTextSecondary,
                     fontSize = 12.sp
                 )
@@ -201,7 +202,7 @@ fun MobileHomeScreen(
 
         Spacer(modifier = Modifier.height(28.dp))
 
-        // Botón SOS o Cuenta regresiva local
+        // Botón SOS o Cuenta regresiva
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier.fillMaxWidth()
@@ -217,7 +218,7 @@ fun MobileHomeScreen(
                         modifier = Modifier.padding(20.dp)
                     ) {
                         Text(
-                            text = "Enviando alerta de prueba en",
+                            text = "Preparando alerta en",
                             color = AlertaTextSecondary,
                             fontSize = 13.sp
                         )
@@ -238,7 +239,7 @@ fun MobileHomeScreen(
                             shape = RoundedCornerShape(16.dp)
                         ) {
                             Text(
-                                text = "Cancelar cuenta regresiva",
+                                text = "Cancelar",
                                 fontWeight = FontWeight.Bold
                             )
                         }
@@ -290,16 +291,9 @@ fun MobileHomeScreen(
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium
                     )
-                    if (contact.isSimulatedSample) {
-                        Text(
-                            text = "Dato de prueba local configurado (toca para editar)",
-                            color = AlertaTextSecondary,
-                            fontSize = 11.sp
-                        )
-                    }
                 } else {
                     Text(
-                        text = "Configura un contacto en la app (toca aquí)",
+                        text = "Configura un contacto en la app",
                         color = AlertaTextSecondary,
                         fontSize = 12.sp
                     )
@@ -307,42 +301,54 @@ fun MobileHomeScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
-        // Panel explícito de simulación Etapa 1
+        // Estado de permiso de ubicación para que el teléfono pueda obtener coordenadas al recibir SOS
         Surface(
-            color = AlertaSurface.copy(alpha = 0.6f),
-            shape = RoundedCornerShape(14.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .border(1.dp, AlertaTextSecondary.copy(alpha = 0.25f), RoundedCornerShape(14.dp))
+            color = AlertaSurface,
+            shape = RoundedCornerShape(18.dp),
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Column(
-                modifier = Modifier.padding(14.dp)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 18.dp, vertical = 14.dp)
             ) {
-                Text(
-                    text = "MODO DEMOSTRACIÓN LOCAL (ETAPA 1)",
-                    color = AlertaStatusAmber,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "Prueba la pantalla de Alerta en proceso como si llegara la solicitud desde el reloj.",
-                    color = AlertaTextSecondary,
-                    fontSize = 12.sp
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                TextButton(
-                    onClick = onSimulateWatchAlert,
-                    modifier = Modifier.align(Alignment.End)
-                ) {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Simular solicitud desde reloj →",
-                        color = AlertaCoral,
-                        fontSize = 12.sp,
+                        text = "Ubicación del teléfono",
+                        color = AlertaTextPrimary,
+                        fontSize = 13.sp,
                         fontWeight = FontWeight.Bold
                     )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    val locText = when {
+                        !uiState.hasLocationPermission -> "Permiso pendiente de conceder"
+                        !uiState.isLocationServicesEnabled -> "GPS desactivado en ajustes"
+                        else -> "Permiso activo y GPS habilitado"
+                    }
+                    val locColor = if (uiState.hasLocationPermission && uiState.isLocationServicesEnabled) {
+                        AlertaStatusGreen
+                    } else {
+                        AlertaStatusAmber
+                    }
+                    Text(
+                        text = locText,
+                        color = locColor,
+                        fontSize = 12.sp
+                    )
+                }
+                if (!uiState.hasLocationPermission) {
+                    TextButton(onClick = onRequestLocationPermission) {
+                        Text(
+                            text = "Permitir",
+                            color = AlertaCoral,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
             }
         }
@@ -393,7 +399,6 @@ fun HoldableSosButton(
                         isPressed = false
                     },
                     onLongPress = {
-                        // Respaldo para accesibilidad y gestos largos estándar
                         if (isPressed) {
                             isPressed = false
                             progress = 0f
@@ -435,8 +440,7 @@ fun MobileContactScreen(
     uiState: MobileUiState,
     onDraftNameChange: (String) -> Unit,
     onDraftPhoneChange: (String) -> Unit,
-    onSaveContact: () -> Unit,
-    onFillSampleContact: () -> Unit
+    onSaveContact: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -561,15 +565,6 @@ fun MobileContactScreen(
             color = AlertaTextSecondary,
             fontSize = 12.sp
         )
-
-        Spacer(modifier = Modifier.height(16.dp))
-        TextButton(onClick = onFillSampleContact) {
-            Text(
-                text = "Cargar contacto de prueba (María · +52 844 000 0000)",
-                color = AlertaStatusAmber,
-                fontSize = 12.sp
-            )
-        }
     }
 }
 
@@ -577,7 +572,7 @@ fun MobileContactScreen(
 fun MobileAlertInProgressScreen(
     uiState: MobileUiState,
     onCancelActiveAlert: () -> Unit,
-    onSimulateErrorAlert: () -> Unit,
+    onRequestLocationPermission: () -> Unit,
     onOpenContact: () -> Unit
 ) {
     Column(
@@ -596,11 +591,7 @@ fun MobileAlertInProgressScreen(
         )
         Spacer(modifier = Modifier.height(6.dp))
         Text(
-            text = if (uiState.activeAlertOrigin == AlertOrigin.WATCH_SIMULATED) {
-                "Desde tu reloj (Simulado en Etapa 1)"
-            } else {
-                uiState.activeAlertOrigin.label
-            },
+            text = uiState.activeAlertOrigin.label,
             color = AlertaTextSecondary,
             fontSize = 14.sp
         )
@@ -618,7 +609,7 @@ fun MobileAlertInProgressScreen(
             ) {
                 val headerText = when (uiState.activeAlertStatus) {
                     AlertStatus.PENDING -> "Preparando aviso"
-                    AlertStatus.PREPARED -> "Aviso preparado (Sin envío real)"
+                    AlertStatus.PREPARED -> "Solicitud recibida · Aviso preparado"
                     AlertStatus.CANCELLED -> "Alerta cancelada"
                     AlertStatus.ERROR -> "Error en la preparación"
                 }
@@ -638,6 +629,17 @@ fun MobileAlertInProgressScreen(
                     },
                     fontSize = 13.sp
                 )
+                if (!uiState.hasLocationPermission) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TextButton(onClick = onRequestLocationPermission) {
+                        Text(
+                            text = "Conceder permiso de ubicación",
+                            color = AlertaCoral,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
             }
         }
 
@@ -669,7 +671,7 @@ fun MobileAlertInProgressScreen(
                     Spacer(modifier = Modifier.height(4.dp))
                 } else {
                     Text(
-                        text = "Sin contacto configurado",
+                        text = "Sin contacto configurado (toca para configurar)",
                         color = AlertaStatusError,
                         fontSize = 12.sp,
                         modifier = Modifier.clickable(onClick = onOpenContact)
@@ -677,7 +679,7 @@ fun MobileAlertInProgressScreen(
                     Spacer(modifier = Modifier.height(4.dp))
                 }
                 Text(
-                    text = uiState.activeAlertStatus.displayLabel,
+                    text = "Envío pendiente de confirmación (Fase 2: sin envío externo)",
                     color = AlertaTextSecondary,
                     fontSize = 12.sp
                 )
@@ -712,25 +714,13 @@ fun MobileAlertInProgressScreen(
                 fontWeight = FontWeight.Bold
             )
         }
-
-        Spacer(modifier = Modifier.height(12.dp))
-        TextButton(
-            onClick = onSimulateErrorAlert,
-            modifier = Modifier.align(Alignment.CenterHorizontally)
-        ) {
-            Text(
-                text = "Simular estado de error en preparación",
-                color = AlertaStatusAmber,
-                fontSize = 12.sp
-            )
-        }
     }
 }
 
 @Composable
 fun MobileHistoryScreen(
     uiState: MobileUiState,
-    onSimulateWatchAlert: () -> Unit
+    onRequestLocationPermission: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -755,7 +745,7 @@ fun MobileHistoryScreen(
 
         Spacer(modifier = Modifier.height(22.dp))
 
-        uiState.historyEvents.forEach { event ->
+        if (uiState.historyEvents.isEmpty()) {
             Surface(
                 color = AlertaSurface,
                 shape = RoundedCornerShape(18.dp),
@@ -767,30 +757,63 @@ fun MobileHistoryScreen(
                     modifier = Modifier.padding(horizontal = 18.dp, vertical = 18.dp)
                 ) {
                     Text(
-                        text = event.title,
+                        text = "Sin eventos registrados todavía",
                         color = AlertaTextPrimary,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "${event.timestampLabel} · ${event.origin.label}",
+                        text = "Cuando inicies una alerta desde el reloj o el teléfono, aparecerá aquí con el resultado de ubicación.",
                         color = AlertaTextSecondary,
                         fontSize = 12.sp
                     )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    val badgeColor = when (event.status) {
-                        AlertStatus.PENDING -> AlertaStatusAmber
-                        AlertStatus.PREPARED -> AlertaStatusAmber
-                        AlertStatus.CANCELLED -> AlertaTextSecondary
-                        AlertStatus.ERROR -> AlertaStatusError
+                }
+            }
+        } else {
+            uiState.historyEvents.forEach { event ->
+                Surface(
+                    color = AlertaSurface,
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 14.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 18.dp)
+                    ) {
+                        Text(
+                            text = event.title,
+                            color = AlertaTextPrimary,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "${event.timestampLabel} · ${event.origin.label}",
+                            color = AlertaTextSecondary,
+                            fontSize = 12.sp
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = event.locationNote,
+                            color = AlertaTextSecondary,
+                            fontSize = 12.sp
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        val badgeColor = when (event.status) {
+                            AlertStatus.PENDING -> AlertaStatusAmber
+                            AlertStatus.PREPARED -> AlertaStatusAmber
+                            AlertStatus.CANCELLED -> AlertaTextSecondary
+                            AlertStatus.ERROR -> AlertaStatusError
+                        }
+                        Text(
+                            text = "● ${event.status.displayLabel}",
+                            color = badgeColor,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
-                    Text(
-                        text = "● ${event.status.displayLabel}",
-                        color = badgeColor,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold
-                    )
                 }
             }
         }
@@ -818,6 +841,17 @@ fun MobileHistoryScreen(
                     color = AlertaTextSecondary,
                     fontSize = 12.sp
                 )
+                if (!uiState.hasLocationPermission) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TextButton(onClick = onRequestLocationPermission) {
+                        Text(
+                            text = "Conceder permiso de ubicación",
+                            color = AlertaCoral,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
             }
         }
 
@@ -829,16 +863,6 @@ fun MobileHistoryScreen(
             fontSize = 12.sp,
             lineHeight = 18.sp
         )
-
-        Spacer(modifier = Modifier.height(12.dp))
-        TextButton(onClick = onSimulateWatchAlert) {
-            Text(
-                text = "Generar nueva prueba de alerta",
-                color = AlertaCoral,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold
-            )
-        }
     }
 }
 
@@ -882,18 +906,23 @@ fun MobileHomeScreenPreview() {
     AlertaWearTheme {
         AlertaWearMobileApp(
             uiState = MobileUiState(
-                trustedContact = TrustedContact("María", "+52 844 000 0000", isSimulatedSample = true),
-                historyEvents = SharedPrefsAlertStorage.defaultSampleHistory()
+                watchConnection = WatchConnectionState(
+                    isConnected = true,
+                    connectedNodeName = "Wear OS XL Round",
+                    isChecking = false
+                ),
+                hasLocationPermission = true,
+                isLocationServicesEnabled = true,
+                trustedContact = TrustedContact("María", "+52 844 000 0000")
             ),
             onNavigate = {},
+            onRefreshStatus = {},
+            onRequestLocationPermission = {},
             onDraftNameChange = {},
             onDraftPhoneChange = {},
             onSaveContact = {},
-            onFillSampleContact = {},
             onSosLongPressed = {},
             onCancelCountdown = {},
-            onSimulateWatchAlert = {},
-            onSimulateErrorAlert = {},
             onCancelActiveAlert = {}
         )
     }

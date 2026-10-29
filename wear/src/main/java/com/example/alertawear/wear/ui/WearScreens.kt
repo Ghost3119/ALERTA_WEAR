@@ -48,7 +48,6 @@ import kotlinx.coroutines.delay
 
 val WearBgColor = Color(0xFF101522)
 val WearSurfaceColor = Color(0xFF1C2534)
-val WearActiveSurfaceColor = Color(0xFF44282D)
 val WearCoralColor = Color(0xFFFF6C68)
 val WearTextPrimary = Color(0xFFF6F7FB)
 val WearTextSecondary = Color(0xFFAAB7C9)
@@ -61,8 +60,8 @@ fun AlertaWearWatchApp(
     onSosLongPressed: () -> Unit,
     onCancelCountdown: () -> Unit,
     onRetryConnection: () -> Unit,
-    onToggleDemoConnectionMode: () -> Unit,
-    onNavigateToScreen: (WearScreen) -> Unit
+    onRefreshConnection: () -> Unit,
+    onReturnToHome: () -> Unit
 ) {
     MaterialTheme {
         Box(
@@ -75,7 +74,7 @@ fun AlertaWearWatchApp(
                 WearScreen.HOME -> WearHomeScreen(
                     uiState = uiState,
                     onSosLongPressed = onSosLongPressed,
-                    onToggleDemoConnectionMode = onToggleDemoConnectionMode
+                    onRefreshConnection = onRefreshConnection
                 )
 
                 WearScreen.COUNTDOWN -> WearCountdownScreen(
@@ -84,13 +83,14 @@ fun AlertaWearWatchApp(
                 )
 
                 WearScreen.IN_PROGRESS -> WearAlertInProgressScreen(
-                    statusDetail = uiState.statusDetailMessage,
-                    onBackToHome = { onNavigateToScreen(WearScreen.HOME) },
-                    onShowNoConnectionDemo = { onNavigateToScreen(WearScreen.NO_CONNECTION) }
+                    uiState = uiState,
+                    onBackToHome = onReturnToHome
                 )
 
                 WearScreen.NO_CONNECTION -> WearNoConnectionScreen(
-                    onRetry = onRetryConnection
+                    reasonText = uiState.noConnectionReason,
+                    onRetry = onRetryConnection,
+                    onBackToHome = onReturnToHome
                 )
             }
         }
@@ -101,7 +101,7 @@ fun AlertaWearWatchApp(
 fun WearHomeScreen(
     uiState: WearUiState,
     onSosLongPressed: () -> Unit,
-    onToggleDemoConnectionMode: () -> Unit
+    onRefreshConnection: () -> Unit
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -132,21 +132,20 @@ fun WearHomeScreen(
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Indicador inferior: toca para alternar en Etapa 1 entre Demo local y Sin conexión
         val badgeColor = when {
-            uiState.isRealPhoneConnected -> WearStatusGreen
-            uiState.simulatePhoneReachableForDemo -> WearStatusAmber
+            uiState.isCheckingConnection -> WearStatusAmber
+            uiState.isPhoneConnected -> WearStatusGreen
             else -> WearCoralColor
         }
         Text(
             text = uiState.connectionBadgeText,
             color = badgeColor,
-            fontSize = 9.sp,
+            fontSize = 10.sp,
             fontWeight = FontWeight.Bold,
             textAlign = TextAlign.Center,
             modifier = Modifier
                 .clip(RoundedCornerShape(8.dp))
-                .clickable(onClick = onToggleDemoConnectionMode)
+                .clickable(onClick = onRefreshConnection)
                 .padding(horizontal = 6.dp, vertical = 2.dp)
         )
     }
@@ -288,9 +287,8 @@ fun WearCountdownScreen(
 
 @Composable
 fun WearAlertInProgressScreen(
-    statusDetail: String,
-    onBackToHome: () -> Unit,
-    onShowNoConnectionDemo: () -> Unit
+    uiState: WearUiState,
+    onBackToHome: () -> Unit
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -307,7 +305,7 @@ fun WearAlertInProgressScreen(
         )
         Spacer(modifier = Modifier.height(10.dp))
         Text(
-            text = "Aviso en proceso",
+            text = uiState.inProgressTitle,
             color = WearTextPrimary,
             fontSize = 15.sp,
             fontWeight = FontWeight.Bold,
@@ -315,34 +313,38 @@ fun WearAlertInProgressScreen(
         )
         Spacer(modifier = Modifier.height(6.dp))
         Text(
-            text = "Revisa el celular",
+            text = uiState.inProgressSubtitle,
             color = WearTextSecondary,
             fontSize = 12.sp,
             textAlign = TextAlign.Center
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "$statusDetail (Simulado)",
+            text = uiState.statusDetailMessage,
             color = WearStatusAmber,
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.clickable(onClick = onShowNoConnectionDemo)
+            textAlign = TextAlign.Center
         )
-        Spacer(modifier = Modifier.height(6.dp))
+        Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "No cierres la app",
+            text = uiState.footerMessage,
             color = WearTextSecondary,
             fontSize = 11.sp,
             textAlign = TextAlign.Center,
-            modifier = Modifier.clickable(onClick = onBackToHome)
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(onClick = onBackToHome)
+                .padding(horizontal = 8.dp, vertical = 4.dp)
         )
     }
 }
 
 @Composable
 fun WearNoConnectionScreen(
-    onRetry: () -> Unit
+    reasonText: String,
+    onRetry: () -> Unit,
+    onBackToHome: () -> Unit
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -355,7 +357,8 @@ fun WearNoConnectionScreen(
             text = "ALERTA WEAR",
             color = WearCoralColor,
             fontSize = 10.sp,
-            fontWeight = FontWeight.Bold
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.clickable(onClick = onBackToHome)
         )
         Spacer(modifier = Modifier.height(10.dp))
         Text(
@@ -367,7 +370,7 @@ fun WearNoConnectionScreen(
         )
         Spacer(modifier = Modifier.height(6.dp))
         Text(
-            text = "Abre la aplicación\nen tu teléfono",
+            text = reasonText,
             color = WearTextSecondary,
             fontSize = 11.sp,
             textAlign = TextAlign.Center,
@@ -399,50 +402,15 @@ fun WearNoConnectionScreen(
 @Composable
 fun WearHomePreview() {
     AlertaWearWatchApp(
-        uiState = WearUiState(currentScreen = WearScreen.HOME),
+        uiState = WearUiState(
+            currentScreen = WearScreen.HOME,
+            isCheckingConnection = false,
+            isPhoneConnected = true
+        ),
         onSosLongPressed = {},
         onCancelCountdown = {},
         onRetryConnection = {},
-        onToggleDemoConnectionMode = {},
-        onNavigateToScreen = {}
-    )
-}
-
-@Preview(widthDp = 240, heightDp = 240, showBackground = true)
-@Composable
-fun WearCountdownPreview() {
-    AlertaWearWatchApp(
-        uiState = WearUiState(currentScreen = WearScreen.COUNTDOWN, countdownSeconds = 5),
-        onSosLongPressed = {},
-        onCancelCountdown = {},
-        onRetryConnection = {},
-        onToggleDemoConnectionMode = {},
-        onNavigateToScreen = {}
-    )
-}
-
-@Preview(widthDp = 240, heightDp = 240, showBackground = true)
-@Composable
-fun WearInProgressPreview() {
-    AlertaWearWatchApp(
-        uiState = WearUiState(currentScreen = WearScreen.IN_PROGRESS),
-        onSosLongPressed = {},
-        onCancelCountdown = {},
-        onRetryConnection = {},
-        onToggleDemoConnectionMode = {},
-        onNavigateToScreen = {}
-    )
-}
-
-@Preview(widthDp = 240, heightDp = 240, showBackground = true)
-@Composable
-fun WearNoConnectionPreview() {
-    AlertaWearWatchApp(
-        uiState = WearUiState(currentScreen = WearScreen.NO_CONNECTION),
-        onSosLongPressed = {},
-        onCancelCountdown = {},
-        onRetryConnection = {},
-        onToggleDemoConnectionMode = {},
-        onNavigateToScreen = {}
+        onRefreshConnection = {},
+        onReturnToHome = {}
     )
 }

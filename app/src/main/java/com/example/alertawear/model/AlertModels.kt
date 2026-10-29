@@ -13,17 +13,22 @@ data class TrustedContact(
 }
 
 /**
- * Estados de preparación de una alerta en la Etapa 1 (sin afirmar nunca "enviado" o "entregado"
- * cuando solamente se ha preparado o simulado localmente).
+ * Estados de preparación de una alerta en la Fase 2.
+ * Distingue claramente entre:
+ * - Solicitud recibida y en preparación (PENDING)
+ * - Aviso preparado en el teléfono con o sin ubicación (PREPARED)
+ * - Alerta cancelada (CANCELLED)
+ * - Error de preparación, como falta de contacto (ERROR)
+ * Nunca afirma que se envió un mensaje externo (SMS/WhatsApp) a un contacto.
  */
 enum class AlertStatus(val displayLabel: String, val description: String) {
     PENDING(
-        displayLabel = "Envío pendiente de confirmación",
-        description = "Preparando datos y buscando ubicación..."
+        displayLabel = "Solicitud recibida · Preparando aviso",
+        description = "Obteniendo ubicación en el teléfono..."
     ),
     PREPARED(
-        displayLabel = "Aviso preparado",
-        description = "Información lista. Envío real aún no ejecutado."
+        displayLabel = "Aviso preparado (Sin envío externo)",
+        description = "Información de alerta preparada en el teléfono."
     ),
     CANCELLED(
         displayLabel = "Alerta cancelada",
@@ -36,50 +41,69 @@ enum class AlertStatus(val displayLabel: String, val description: String) {
 }
 
 /**
- * Estado de la verificación de conexión con el reloj Wear OS.
- * Por requerimiento de Etapa 1, NO se muestra el reloj como conectado si no se ha comprobado
- * una conexión real.
+ * Resultado del intento de obtener la ubicación en el teléfono.
  */
-enum class WatchConnectionStatus(
-    val title: String,
-    val subtitle: String,
-    val isConnected: Boolean
+enum class LocationOutcomeStatus(val label: String) {
+    ACQUIRED("Ubicación obtenida"),
+    PERMISSION_DENIED("Permiso de ubicación denegado"),
+    BACKGROUND_RESTRICTED("Sin permiso en segundo plano (abre la app)"),
+    DISABLED("Ubicación / GPS desactivado en el teléfono"),
+    TIMEOUT("Tiempo de espera agotado al buscar ubicación"),
+    UNAVAILABLE("Ubicación no disponible")
+}
+
+data class LocationResult(
+    val status: LocationOutcomeStatus,
+    val latitude: Double? = null,
+    val longitude: Double? = null,
+    val accuracyMeters: Float? = null,
+    val detailText: String
+)
+
+/**
+ * Estado real de la conexión con el reloj Wear OS mediante Wearable Data Layer (NodeClient).
+ */
+data class WatchConnectionState(
+    val isConnected: Boolean = false,
+    val connectedNodeName: String? = null,
+    val connectedNodeId: String? = null,
+    val isChecking: Boolean = true
 ) {
-    UNVERIFIED(
-        title = "Conexión con reloj sin verificar",
-        subtitle = "Etapa 1: Demostración local sin vínculo activo",
-        isConnected = false
-    ),
-    DISCONNECTED(
-        title = "Reloj sin conexión",
-        subtitle = "Verifica el vínculo Bluetooth y abre la app en el reloj",
-        isConnected = false
-    ),
-    SIMULATED_CONNECTED(
-        title = "Reloj conectado (Simulado)",
-        subtitle = "Listo para recibir alertas (vista previa de diseño)",
-        isConnected = true
-    )
+    val title: String
+        get() = when {
+            isChecking -> "Verificando conexión con reloj..."
+            isConnected && !connectedNodeName.isNullOrBlank() -> "Reloj conectado ($connectedNodeName)"
+            isConnected -> "Reloj conectado"
+            else -> "Reloj desconectado"
+        }
+
+    val subtitle: String
+        get() = when {
+            isChecking -> "Consultando nodos de Wear OS Data Layer..."
+            isConnected -> "Listo para recibir solicitudes SOS reales"
+            else -> "Empareja el emulador en Device Manager → Pair Wearable"
+        }
 }
 
 /**
  * Origen del evento de alerta.
  */
 enum class AlertOrigin(val label: String) {
-    WATCH_SIMULATED("Desde tu reloj (Simulado)"),
-    PHONE_LOCAL("Prueba local en teléfono"),
-    SAMPLE_DATA("Registro de ejemplo (Simulado)")
+    WATCH_DATA_LAYER("Desde tu reloj (Wear Data Layer)"),
+    PHONE_LOCAL("Iniciada en el teléfono")
 }
 
 /**
  * Evento registrado en el historial local del teléfono.
+ * Incluye `requestId` para evitar duplicados cuando un reintento envía la misma solicitud.
  */
 data class AlertHistoryEvent(
     val id: String,
+    val requestId: String,
     val title: String,
     val timestampLabel: String,
     val status: AlertStatus,
     val origin: AlertOrigin,
-    val locationNote: String = "Ubicación simulada (pendiente GPS real en Etapa 2)",
-    val isSimulated: Boolean = true
+    val locationNote: String,
+    val isSimulated: Boolean = false
 )

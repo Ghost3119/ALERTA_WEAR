@@ -1,10 +1,16 @@
 package com.example.alertawear
 
 import com.example.alertawear.data.InMemoryAlertStorage
+import com.example.alertawear.data.PhoneLocationProvider
+import com.example.alertawear.data.PhoneSosRequestProcessor
+import com.example.alertawear.data.RealLocationAlertGateway
+import com.example.alertawear.data.WatchConnectionMonitor
 import com.example.alertawear.model.AlertOrigin
 import com.example.alertawear.model.AlertStatus
+import com.example.alertawear.model.LocationOutcomeStatus
+import com.example.alertawear.model.LocationResult
 import com.example.alertawear.model.TrustedContact
-import com.example.alertawear.model.WatchConnectionStatus
+import com.example.alertawear.model.WatchConnectionState
 import com.example.alertawear.ui.MobileAlertViewModel
 import com.example.alertawear.ui.MobileScreen
 import kotlinx.coroutines.Dispatchers
@@ -29,6 +35,30 @@ class MobileAlertViewModelTest {
 
     private val testDispatcher = StandardTestDispatcher()
 
+    private class FakeLocationProvider(
+        var hasPermission: Boolean = true,
+        var isEnabled: Boolean = true,
+        var result: LocationResult = LocationResult(
+            status = LocationOutcomeStatus.ACQUIRED,
+            latitude = 25.42321,
+            longitude = -101.0053,
+            detailText = "Ubicación preparada: 25.42321, -101.00530"
+        )
+    ) : PhoneLocationProvider {
+        override fun hasForegroundLocationPermission(): Boolean = hasPermission
+        override fun isLocationEnabled(): Boolean = isEnabled
+        override suspend fun obtainLocation(isAppInForeground: Boolean): LocationResult = result
+    }
+
+    private class FakeWatchMonitor(
+        var state: WatchConnectionState = WatchConnectionState(
+            isConnected = false,
+            isChecking = false
+        )
+    ) : WatchConnectionMonitor {
+        override suspend fun checkConnectedWatch(): WatchConnectionState = state
+    }
+
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
@@ -40,19 +70,26 @@ class MobileAlertViewModelTest {
     }
 
     @Test
-    fun `initial watch connection status is unverified and not connected`() {
+    fun `initial watch connection reflects real monitor state`() = runTest {
         val storage = InMemoryAlertStorage()
-        val viewModel = MobileAlertViewModel(storage = storage)
+        val locProvider = FakeLocationProvider()
+        val gateway = RealLocationAlertGateway(locProvider)
+        val monitor = FakeWatchMonitor(
+            WatchConnectionState(isConnected = false, isChecking = false)
+        )
+        val viewModel = MobileAlertViewModel(storage, gateway, monitor, locProvider)
 
-        val state = viewModel.uiState.value
-        assertEquals(WatchConnectionStatus.UNVERIFIED, state.watchConnectionStatus)
-        assertFalse(state.watchConnectionStatus.isConnected)
+        advanceUntilIdle()
+        assertFalse(viewModel.uiState.value.watchConnection.isConnected)
     }
 
     @Test
-    fun `saveContact persists valid contact and updates state`() {
+    fun `saveContact persists valid contact and updates state`() = runTest {
         val storage = InMemoryAlertStorage()
-        val viewModel = MobileAlertViewModel(storage = storage)
+        val locProvider = FakeLocationProvider()
+        val gateway = RealLocationAlertGateway(locProvider)
+        val monitor = FakeWatchMonitor()
+        val viewModel = MobileAlertViewModel(storage, gateway, monitor, locProvider)
 
         viewModel.onDraftNameChanged("María")
         viewModel.onDraftPhoneChanged("+52 844 000 0000")
@@ -62,18 +99,22 @@ class MobileAlertViewModelTest {
         assertNotNull(saved)
         assertEquals("María", saved?.name)
         assertEquals("+52 844 000 0000", saved?.phone)
-        assertTrue(saved?.isSimulatedSample == true)
     }
 
     @Test
     fun `countdown can be cancelled before triggering alert preparation`() = runTest {
         val storage = InMemoryAlertStorage(
-            initialContact = TrustedContact("María", "+52 844 123 4567", isSimulatedSample = false)
+            initialContact = TrustedContact("María", "+52 844 123 4567")
         )
+        val locProvider = FakeLocationProvider()
+        val gateway = RealLocationAlertGateway(locProvider)
+        val monitor = FakeWatchMonitor()
         val viewModel = MobileAlertViewModel(
             storage = storage,
-            countdownTickMs = 100L,
-            locationPrepDelayMs = 100L
+            gateway = gateway,
+            watchConnectionMonitor = monitor,
+            locationProvider = locProvider,
+            countdownTickMs = 100L
         )
 
         viewModel.startSosCountdown(AlertOrigin.PHONE_LOCAL)
@@ -86,38 +127,57 @@ class MobileAlertViewModelTest {
     }
 
     @Test
-    fun `triggerAlertPreparation transitions from PENDING to PREPARED when contact exists`() = runTest {
+    fun `processor deduplicates repeated requestId on retry and sends ACKs`() = runTest {
         val storage = InMemoryAlertStorage(
-            initialContact = TrustedContact("Carlos", "+52 844 999 8888", isSimulatedSample = false)
+            initialContact = TrustedContact("Carlos", "+52 844 999 8888")
         )
-        val viewModel = MobileAlertViewModel(
+        val locProvider = FakeLocationProvider()
+        val gateway = RealLocationAlertGateway(locProvider)
+        val sentAcks = mutableListOf<String>()
+
+        val processor = PhoneSosRequestProcessor(
             storage = storage,
-            countdownTickMs = 100L,
-            locationPrepDelayMs = 200L
+            gateway = gateway,
+            ackSender = { _, _, ackStatus, _ ->
+                sentAcks.add(ackStatus)
+            }
         )
 
-        viewModel.triggerAlertPreparation(AlertOrigin.WATCH_SIMULATED)
-        assertEquals(MobileScreen.ALERT_IN_PROGRESS, viewModel.uiState.value.currentScreen)
-        assertEquals(AlertStatus.PENDING, viewModel.uiState.value.activeAlertStatus)
+        // Primera solicitud con requestId "sos_100"
+        processor.processIncomingSos("node_1", "sos_100", isAppInForeground = true)
+        // Reintento con el mismo requestId "sos_100"
+        processor.processIncomingSos("node_1", "sos_100", isAppInForeground = true)
 
-        advanceUntilIdle()
-        assertEquals(AlertStatus.PREPARED, viewModel.uiState.value.activeAlertStatus)
-        assertEquals(AlertStatus.PREPARED, viewModel.uiState.value.historyEvents.first().status)
+        // El historial debe tener exactamente 1 registro para "sos_100", no duplicados
+        val history = storage.loadHistory()
+        assertEquals(1, history.size)
+        assertEquals("sos_100", history.first().requestId)
+        assertEquals(AlertStatus.PREPARED, history.first().status)
+        assertTrue(sentAcks.contains(RealLocationAlertGateway.ACK_RECEIVED_PREPARING))
+        assertTrue(sentAcks.contains(RealLocationAlertGateway.ACK_PREPARED_WITH_LOCATION))
     }
 
     @Test
-    fun `triggerAlertPreparation results in ERROR when no contact is configured`() = runTest {
-        val storage = InMemoryAlertStorage(initialContact = null)
-        val viewModel = MobileAlertViewModel(
-            storage = storage,
-            countdownTickMs = 100L,
-            locationPrepDelayMs = 200L
+    fun `permission denied still prepares alert with clear no-location note`() = runTest {
+        val storage = InMemoryAlertStorage(
+            initialContact = TrustedContact("Carlos", "+52 844 999 8888")
         )
+        val locProvider = FakeLocationProvider(
+            hasPermission = false,
+            result = LocationResult(
+                status = LocationOutcomeStatus.PERMISSION_DENIED,
+                detailText = "Permiso de ubicación denegado en el teléfono."
+            )
+        )
+        val gateway = RealLocationAlertGateway(locProvider)
+        val monitor = FakeWatchMonitor()
+        val viewModel = MobileAlertViewModel(storage, gateway, monitor, locProvider)
 
-        viewModel.triggerAlertPreparation(AlertOrigin.WATCH_SIMULATED)
+        viewModel.triggerAlertPreparation(requestId = "req_perm_denied", origin = AlertOrigin.WATCH_DATA_LAYER)
         advanceUntilIdle()
 
-        assertEquals(AlertStatus.ERROR, viewModel.uiState.value.activeAlertStatus)
-        assertEquals(AlertStatus.ERROR, viewModel.uiState.value.historyEvents.first().status)
+        assertEquals(MobileScreen.ALERT_IN_PROGRESS, viewModel.uiState.value.currentScreen)
+        assertEquals(AlertStatus.PREPARED, viewModel.uiState.value.activeAlertStatus)
+        assertTrue(viewModel.uiState.value.activeLocationStatusText.contains("Permiso de ubicación denegado"))
     }
 }

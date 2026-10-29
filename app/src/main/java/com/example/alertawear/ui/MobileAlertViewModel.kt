@@ -3,14 +3,17 @@ package com.example.alertawear.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.example.alertawear.data.AlertEventBus
 import com.example.alertawear.data.AlertPreparationGateway
 import com.example.alertawear.data.LocalAlertStorage
-import com.example.alertawear.data.LocalDemoAlertGateway
+import com.example.alertawear.data.PhoneLocationProvider
+import com.example.alertawear.data.SharedPrefsAlertStorage
+import com.example.alertawear.data.WatchConnectionMonitor
 import com.example.alertawear.model.AlertHistoryEvent
 import com.example.alertawear.model.AlertOrigin
 import com.example.alertawear.model.AlertStatus
 import com.example.alertawear.model.TrustedContact
-import com.example.alertawear.model.WatchConnectionStatus
+import com.example.alertawear.model.WatchConnectionState
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,9 +21,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 enum class MobileScreen(val label: String) {
     HOME("Inicio"),
@@ -31,24 +31,28 @@ enum class MobileScreen(val label: String) {
 
 data class MobileUiState(
     val currentScreen: MobileScreen = MobileScreen.HOME,
-    val watchConnectionStatus: WatchConnectionStatus = WatchConnectionStatus.UNVERIFIED,
+    val watchConnection: WatchConnectionState = WatchConnectionState(),
+    val hasLocationPermission: Boolean = false,
+    val isLocationServicesEnabled: Boolean = false,
     val trustedContact: TrustedContact? = null,
     val draftContactName: String = "",
     val draftContactPhone: String = "",
     val contactSavedFeedback: String? = null,
     val countdownSeconds: Int? = null,
+    val activeRequestId: String? = null,
     val activeAlertStatus: AlertStatus = AlertStatus.PENDING,
-    val activeAlertOrigin: AlertOrigin = AlertOrigin.WATCH_SIMULATED,
-    val activeLocationStatusText: String = "Buscando ubicación...",
+    val activeAlertOrigin: AlertOrigin = AlertOrigin.WATCH_DATA_LAYER,
+    val activeLocationStatusText: String = "Esperando solicitud SOS...",
     val activeDetailText: String = "Envío pendiente de confirmación",
     val historyEvents: List<AlertHistoryEvent> = emptyList()
 )
 
 class MobileAlertViewModel(
     private val storage: LocalAlertStorage,
-    private val gateway: AlertPreparationGateway = LocalDemoAlertGateway(),
-    private val countdownTickMs: Long = 1000L,
-    private val locationPrepDelayMs: Long = 1800L
+    private val gateway: AlertPreparationGateway,
+    private val watchConnectionMonitor: WatchConnectionMonitor,
+    private val locationProvider: PhoneLocationProvider,
+    private val countdownTickMs: Long = 1000L
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(MobileUiState())
@@ -65,12 +69,64 @@ class MobileAlertViewModel(
                 trustedContact = savedContact,
                 draftContactName = savedContact?.name.orEmpty(),
                 draftContactPhone = savedContact?.phone.orEmpty(),
+                hasLocationPermission = locationProvider.hasForegroundLocationPermission(),
+                isLocationServicesEnabled = locationProvider.isLocationEnabled(),
                 historyEvents = savedHistory
+            )
+        }
+
+        refreshDeviceAndLocationStatus()
+
+        // Observar solicitudes reales que llegan desde el reloj vía PhoneWearableListenerService
+        viewModelScope.launch {
+            AlertEventBus.latestIncomingEvent.collect { incomingEvent ->
+                if (incomingEvent != null) {
+                    val updatedList = storage.loadHistory()
+                    _uiState.update {
+                        it.copy(
+                            currentScreen = MobileScreen.ALERT_IN_PROGRESS,
+                            activeRequestId = incomingEvent.requestId,
+                            activeAlertOrigin = incomingEvent.origin,
+                            activeAlertStatus = incomingEvent.status,
+                            activeLocationStatusText = incomingEvent.locationNote,
+                            activeDetailText = incomingEvent.status.displayLabel,
+                            historyEvents = updatedList
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun refreshDeviceAndLocationStatus() {
+        viewModelScope.launch {
+            val connection = watchConnectionMonitor.checkConnectedWatch()
+            val hasPerm = locationProvider.hasForegroundLocationPermission()
+            val gpsEnabled = locationProvider.isLocationEnabled()
+            val latestHistory = storage.loadHistory()
+            _uiState.update {
+                it.copy(
+                    watchConnection = connection,
+                    hasLocationPermission = hasPerm,
+                    isLocationServicesEnabled = gpsEnabled,
+                    historyEvents = latestHistory
+                )
+            }
+        }
+    }
+
+    fun onLocationPermissionResult(granted: Boolean) {
+        val gpsEnabled = locationProvider.isLocationEnabled()
+        _uiState.update {
+            it.copy(
+                hasLocationPermission = granted || locationProvider.hasForegroundLocationPermission(),
+                isLocationServicesEnabled = gpsEnabled
             )
         }
     }
 
     fun navigateTo(screen: MobileScreen) {
+        refreshDeviceAndLocationStatus()
         _uiState.update {
             it.copy(
                 currentScreen = screen,
@@ -91,16 +147,6 @@ class MobileAlertViewModel(
         }
     }
 
-    fun fillSampleContact() {
-        _uiState.update {
-            it.copy(
-                draftContactName = "María (Contacto de prueba)",
-                draftContactPhone = "+52 844 000 0000",
-                contactSavedFeedback = "Datos de ejemplo cargados. Presiona Guardar contacto."
-            )
-        }
-    }
-
     fun saveContact() {
         val current = _uiState.value
         val trimmedName = current.draftContactName.trim()
@@ -111,12 +157,10 @@ class MobileAlertViewModel(
             }
             return
         }
-        val isSample = trimmedName.contains("prueba", ignoreCase = true) ||
-            trimmedPhone == "+52 844 000 0000"
         val newContact = TrustedContact(
             name = trimmedName,
             phone = trimmedPhone,
-            isSimulatedSample = isSample
+            isSimulatedSample = false
         )
         storage.saveContact(newContact)
         _uiState.update {
@@ -130,43 +174,51 @@ class MobileAlertViewModel(
     }
 
     /**
-     * Inicia la cuenta regresiva cancelable de 5 segundos al mantener presionado SOS.
+     * Inicia la cuenta regresiva cancelable de 5 segundos al mantener presionado SOS en el teléfono.
      */
     fun startSosCountdown(origin: AlertOrigin = AlertOrigin.PHONE_LOCAL) {
         countdownJob?.cancel()
         preparationJob?.cancel()
+        val reqId = "phone_${System.currentTimeMillis()}"
         countdownJob = viewModelScope.launch {
             for (sec in 5 downTo 1) {
                 _uiState.update {
                     it.copy(
                         countdownSeconds = sec,
+                        activeRequestId = reqId,
                         activeAlertOrigin = origin
                     )
                 }
                 delay(countdownTickMs)
             }
             _uiState.update { it.copy(countdownSeconds = null) }
-            triggerAlertPreparation(origin)
+            triggerAlertPreparation(requestId = reqId, origin = origin)
         }
     }
 
     fun cancelCountdown() {
         countdownJob?.cancel()
         countdownJob = null
-        val origin = _uiState.value.activeAlertOrigin
+        val current = _uiState.value
+        val reqId = current.activeRequestId ?: "cancel_${System.currentTimeMillis()}"
         _uiState.update { it.copy(countdownSeconds = null) }
-        recordHistoryEvent(
+        upsertEvent(
+            requestId = reqId,
             title = "Alerta cancelada en cuenta regresiva",
             status = AlertStatus.CANCELLED,
-            origin = origin,
-            locationNote = "Cancelada antes de preparar ubicación"
+            origin = current.activeAlertOrigin,
+            locationNote = "Cancelada antes de solicitar ubicación"
         )
     }
 
     /**
-     * Inicia el flujo de "Alerta en proceso" (directamente o tras terminar cuenta regresiva).
+     * Ejecuta la preparación real de la alerta en el teléfono (intentando obtener ubicación real
+     * y deduplicando por `requestId`).
      */
-    fun triggerAlertPreparation(origin: AlertOrigin = AlertOrigin.WATCH_SIMULATED) {
+    fun triggerAlertPreparation(
+        requestId: String = "req_${System.currentTimeMillis()}",
+        origin: AlertOrigin = AlertOrigin.PHONE_LOCAL
+    ) {
         countdownJob?.cancel()
         preparationJob?.cancel()
 
@@ -174,17 +226,33 @@ class MobileAlertViewModel(
             it.copy(
                 currentScreen = MobileScreen.ALERT_IN_PROGRESS,
                 countdownSeconds = null,
+                activeRequestId = requestId,
                 activeAlertOrigin = origin,
                 activeAlertStatus = AlertStatus.PENDING,
-                activeLocationStatusText = "Buscando ubicación... (Simulado)",
-                activeDetailText = "Envío pendiente de confirmación"
+                activeLocationStatusText = "Buscando ubicación...",
+                activeDetailText = "Solicitud recibida · Preparando aviso"
             )
         }
 
+        upsertEvent(
+            requestId = requestId,
+            title = if (origin == AlertOrigin.WATCH_DATA_LAYER) {
+                "Solicitud SOS desde reloj"
+            } else {
+                "Solicitud SOS desde teléfono"
+            },
+            status = AlertStatus.PENDING,
+            origin = origin,
+            locationNote = "Buscando ubicación..."
+        )
+
         preparationJob = viewModelScope.launch {
-            delay(locationPrepDelayMs)
             val contact = _uiState.value.trustedContact
-            val result = gateway.prepareAlert(contact, origin)
+            val result = gateway.prepareAlert(
+                contact = contact,
+                origin = origin,
+                isAppInForeground = true
+            )
             _uiState.update {
                 it.copy(
                     activeAlertStatus = result.status,
@@ -192,11 +260,12 @@ class MobileAlertViewModel(
                     activeDetailText = result.detailMessage
                 )
             }
-            recordHistoryEvent(
-                title = if (origin == AlertOrigin.WATCH_SIMULATED) {
-                    "Solicitud desde reloj (Simulado)"
+            upsertEvent(
+                requestId = requestId,
+                title = if (origin == AlertOrigin.WATCH_DATA_LAYER) {
+                    "Solicitud SOS desde reloj"
                 } else {
-                    "Prueba de alerta local"
+                    "Solicitud SOS desde teléfono"
                 },
                 status = result.status,
                 origin = origin,
@@ -208,7 +277,8 @@ class MobileAlertViewModel(
     fun cancelActiveAlert() {
         countdownJob?.cancel()
         preparationJob?.cancel()
-        val origin = _uiState.value.activeAlertOrigin
+        val current = _uiState.value
+        val reqId = current.activeRequestId ?: "cancel_${System.currentTimeMillis()}"
         _uiState.update {
             it.copy(
                 activeAlertStatus = AlertStatus.CANCELLED,
@@ -217,62 +287,50 @@ class MobileAlertViewModel(
                 currentScreen = MobileScreen.HISTORY
             )
         }
-        recordHistoryEvent(
+        upsertEvent(
+            requestId = reqId,
             title = "Alerta cancelada",
             status = AlertStatus.CANCELLED,
-            origin = origin,
+            origin = current.activeAlertOrigin,
             locationNote = "Cancelada durante la preparación"
         )
     }
 
-    fun simulateErrorState() {
-        countdownJob?.cancel()
-        preparationJob?.cancel()
-        val origin = _uiState.value.activeAlertOrigin
-        _uiState.update {
-            it.copy(
-                currentScreen = MobileScreen.ALERT_IN_PROGRESS,
-                activeAlertStatus = AlertStatus.ERROR,
-                activeLocationStatusText = "No se pudo obtener ubicación (Simulado)",
-                activeDetailText = "Error al preparar el aviso. Sin envío."
-            )
-        }
-        recordHistoryEvent(
-            title = "Fallo de preparación (Simulado)",
-            status = AlertStatus.ERROR,
-            origin = origin,
-            locationNote = "Ubicación no disponible en simulación de error"
-        )
-    }
-
-    private fun recordHistoryEvent(
+    private fun upsertEvent(
+        requestId: String,
         title: String,
         status: AlertStatus,
         origin: AlertOrigin,
         locationNote: String
     ) {
-        val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
-        val timestampLabel = "Hoy · ${timeFormat.format(Date())} (Local)"
-        val newEvent = AlertHistoryEvent(
-            id = "evt_${System.currentTimeMillis()}",
+        val event = AlertHistoryEvent(
+            id = "evt_$requestId",
+            requestId = requestId,
             title = title,
-            timestampLabel = timestampLabel,
+            timestampLabel = SharedPrefsAlertStorage.formatCurrentTimestamp(),
             status = status,
             origin = origin,
             locationNote = locationNote,
-            isSimulated = true
+            isSimulated = false
         )
-        _uiState.update { current ->
-            val updated = listOf(newEvent) + current.historyEvents
-            storage.saveHistory(updated)
-            current.copy(historyEvents = updated)
-        }
+        val updated = storage.upsertHistoryEventByRequestId(event)
+        _uiState.update { it.copy(historyEvents = updated) }
     }
 
-    class Factory(private val storage: LocalAlertStorage) : ViewModelProvider.Factory {
+    class Factory(
+        private val storage: LocalAlertStorage,
+        private val gateway: AlertPreparationGateway,
+        private val watchConnectionMonitor: WatchConnectionMonitor,
+        private val locationProvider: PhoneLocationProvider
+    ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
-            return MobileAlertViewModel(storage = storage) as T
+            return MobileAlertViewModel(
+                storage = storage,
+                gateway = gateway,
+                watchConnectionMonitor = watchConnectionMonitor,
+                locationProvider = locationProvider
+            ) as T
         }
     }
 }
