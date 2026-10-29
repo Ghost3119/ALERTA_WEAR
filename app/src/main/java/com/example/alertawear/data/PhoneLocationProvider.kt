@@ -11,6 +11,7 @@ import com.google.android.gms.location.CurrentLocationRequest
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
@@ -79,19 +80,32 @@ class FusedPhoneLocationProvider(
         val cancellationTokenSource = CancellationTokenSource()
 
         return try {
-            val currentRequest = CurrentLocationRequest.Builder()
+            // 1. Intentar primero obtener una ubicación fresca de alta precisión
+            val highAccRequest = CurrentLocationRequest.Builder()
                 .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
                 .setDurationMillis(timeoutMs)
-                .setMaxUpdateAgeMillis(60_000L)
+                .setMaxUpdateAgeMillis(120_000L)
                 .build()
 
-            val freshLocation = withTimeoutOrNull(timeoutMs + 500L) {
-                fusedClient.getCurrentLocation(currentRequest, cancellationTokenSource.token).await()
-            }
-
-            val location = freshLocation ?: runCatching {
-                fusedClient.lastLocation.await()
+            val freshLocation = runCatching {
+                withTimeoutOrNull(timeoutMs) {
+                    fusedClient.getCurrentLocation(highAccRequest, cancellationTokenSource.token).await()
+                }
             }.getOrNull()
+
+            // 2. Respaldo en interiores (Wi-Fi / Celda) o última ubicación conocida del dispositivo
+            val fallbackToken = CancellationTokenSource()
+            val location = freshLocation
+                ?: runCatching { fusedClient.lastLocation.await() }.getOrNull()
+                ?: runCatching {
+                    val balancedReq = CurrentLocationRequest.Builder()
+                        .setPriority(Priority.PRIORITY_BALANCED_POWER_ACCURACY)
+                        .setDurationMillis(3000L)
+                        .build()
+                    withTimeoutOrNull(3200L) {
+                        fusedClient.getCurrentLocation(balancedReq, fallbackToken.token).await()
+                    }
+                }.getOrNull()
 
             if (location != null) {
                 val latFormatted = String.format(Locale.US, "%.5f", location.latitude)
@@ -106,13 +120,18 @@ class FusedPhoneLocationProvider(
             } else {
                 LocationResult(
                     status = LocationOutcomeStatus.TIMEOUT,
-                    detailText = "Tiempo de espera agotado o sin señal GPS disponible."
+                    detailText = "Tiempo de espera agotado al buscar señal de ubicación."
                 )
             }
         } catch (e: SecurityException) {
             LocationResult(
                 status = LocationOutcomeStatus.PERMISSION_DENIED,
-                detailText = "Permiso de ubicación insuficiente (${e.javaClass.simpleName})."
+                detailText = "Permiso de ubicación insuficiente."
+            )
+        } catch (_: CancellationException) {
+            LocationResult(
+                status = LocationOutcomeStatus.TIMEOUT,
+                detailText = "Tiempo de espera agotado al buscar ubicación."
             )
         } catch (e: Exception) {
             LocationResult(

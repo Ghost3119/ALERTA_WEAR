@@ -140,24 +140,23 @@ class PhoneSosRequestProcessor(
  */
 class PhoneWearableListenerService : WearableListenerService() {
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
     override fun onMessageReceived(messageEvent: MessageEvent) {
         super.onMessageReceived(messageEvent)
         if (messageEvent.path == WearDataLayerContract.PATH_SOS_REQUEST) {
+            val appCtx = applicationContext
             val payloadStr = String(messageEvent.data, Charsets.UTF_8)
             val requestId = parseRequestId(payloadStr)
             val sourceNodeId = messageEvent.sourceNodeId
 
-            val storage = SharedPrefsAlertStorage(applicationContext)
-            val locationProvider = FusedPhoneLocationProvider(applicationContext)
+            val storage = SharedPrefsAlertStorage(appCtx)
+            val locationProvider = FusedPhoneLocationProvider(appCtx)
             val gateway = RealLocationAlertGateway(locationProvider)
 
             val processor = PhoneSosRequestProcessor(
                 storage = storage,
                 gateway = gateway,
                 ackSender = { nodeId, reqId, ackStatus, detail ->
-                    sendAckToWatch(nodeId, reqId, ackStatus, detail)
+                    sendAckToWatch(appCtx, nodeId, reqId, ackStatus, detail)
                 }
             )
 
@@ -166,7 +165,8 @@ class PhoneWearableListenerService : WearableListenerService() {
                 showIncomingSosNotification(requestId)
             }
 
-            serviceScope.launch {
+            // Usar un scope que no se cancele cuando WearableListenerService destruya la instancia tras retornar onMessageReceived
+            APP_BACKGROUND_SCOPE.launch {
                 processor.processIncomingSos(
                     sourceNodeId = sourceNodeId,
                     requestId = requestId,
@@ -186,6 +186,7 @@ class PhoneWearableListenerService : WearableListenerService() {
     }
 
     private suspend fun sendAckToWatch(
+        appContext: Context,
         nodeId: String,
         requestId: String,
         ackStatus: String,
@@ -197,7 +198,7 @@ class PhoneWearableListenerService : WearableListenerService() {
                 put("ackStatus", ackStatus)
                 put("detail", detail)
             }
-            Wearable.getMessageClient(applicationContext)
+            Wearable.getMessageClient(appContext)
                 .sendMessage(
                     nodeId,
                     WearDataLayerContract.PATH_SOS_ACK,
@@ -248,8 +249,7 @@ class PhoneWearableListenerService : WearableListenerService() {
         }
     }
 
-    override fun onDestroy() {
-        serviceScope.cancel()
-        super.onDestroy()
+    companion object {
+        private val APP_BACKGROUND_SCOPE = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     }
 }
