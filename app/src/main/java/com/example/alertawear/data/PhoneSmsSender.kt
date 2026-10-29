@@ -11,6 +11,7 @@ import android.os.Build
 import android.telephony.SmsManager
 import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
+import com.example.alertawear.model.AlertHistoryEvent
 import com.example.alertawear.model.AlertStatus
 import com.example.alertawear.model.LocationResult
 import com.example.alertawear.model.TrustedContact
@@ -26,7 +27,22 @@ import java.util.Locale
 interface PhoneSmsSender {
     fun hasSendSmsPermission(): Boolean
     fun canDeviceSendSms(): Boolean
-    fun buildTestAlertMessage(locationResult: LocationResult): String
+
+    /**
+     * Construye el texto del SMS identificándolo claramente como prueba e incluyendo el enlace a
+     * Google Maps cuando hay coordenadas válidas, o explicando por qué la ubicación no está disponible.
+     */
+    fun buildTestAlertMessage(locationResult: LocationResult): String {
+        val mapsUrl = locationResult.mapsUrl
+        return if (mapsUrl != null) {
+            val lat = String.format(Locale.US, "%.5f", locationResult.latitude)
+            val lon = String.format(Locale.US, "%.5f", locationResult.longitude)
+            "Alerta de prueba de Alerta Wear. Necesito ayuda.\nMi ubicación: https://maps.google.com/?q=$lat,$lon"
+        } else {
+            "Alerta de prueba de Alerta Wear. Necesito ayuda.\nUbicación no disponible (${locationResult.status.label})."
+        }
+    }
+
     fun sendAlertSms(
         requestId: String,
         sourceNodeId: String?,
@@ -65,17 +81,6 @@ class AndroidPhoneSmsSender(
         val telephonyManager = context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
             ?: return false
         return telephonyManager.simState == TelephonyManager.SIM_STATE_READY
-    }
-
-    override fun buildTestAlertMessage(locationResult: LocationResult): String {
-        val mapsUrl = locationResult.mapsUrl
-        return if (mapsUrl != null) {
-            val lat = String.format(Locale.US, "%.5f", locationResult.latitude)
-            val lon = String.format(Locale.US, "%.5f", locationResult.longitude)
-            "Alerta de prueba de Alerta Wear. Necesito ayuda.\nMi ubicación: https://maps.google.com/?q=$lat,$lon"
-        } else {
-            "Alerta de prueba de Alerta Wear. Necesito ayuda.\nUbicación no disponible (${locationResult.status.label})."
-        }
     }
 
     override fun sendAlertSms(
@@ -194,6 +199,94 @@ class AndroidPhoneSmsSender(
 }
 
 /**
+ * Procesa el resultado de los callbacks de `SmsManager` (`ACTION_SMS_SENT` y `ACTION_SMS_DELIVERED`),
+ * separando estrictamente "Enviado por el dispositivo (entrega sin confirmar)" (`SENT_BY_DEVICE`)
+ * de "Entregado" (`DELIVERED`).
+ */
+object SmsDeliveryResultProcessor {
+
+    fun handleBroadcastResult(
+        storage: LocalAlertStorage,
+        action: String,
+        resultCode: Int,
+        requestId: String,
+        sourceNodeId: String?,
+        contactName: String,
+        onNotifyWatch: (nodeId: String?, requestId: String, ackStatus: String, detail: String) -> Unit
+    ): AlertHistoryEvent? {
+        val existing = storage.findEventByRequestId(requestId) ?: return null
+
+        return when (action) {
+            AndroidPhoneSmsSender.ACTION_SMS_SENT -> {
+                if (resultCode == Activity.RESULT_OK) {
+                    // Si ya fue marcado como DELIVERED por un callback previo, no degradarlo
+                    if (existing.status == AlertStatus.DELIVERED) return existing
+
+                    val updated = existing.copy(
+                        status = AlertStatus.SENT_BY_DEVICE,
+                        smsStatusNote = "SMS enviado por el dispositivo a $contactName (entrega sin confirmar por el operador)."
+                    )
+                    storage.upsertHistoryEventByRequestId(updated)
+                    onNotifyWatch(
+                        sourceNodeId ?: existing.sourceNodeId,
+                        requestId,
+                        RealLocationAlertGateway.ACK_SMS_SENT_BY_DEVICE,
+                        updated.smsStatusNote
+                    )
+                    updated
+                } else {
+                    val errorReason = mapSmsErrorCode(resultCode)
+                    val updated = existing.copy(
+                        status = AlertStatus.ERROR,
+                        smsStatusNote = "Error al enviar SMS ($errorReason)."
+                    )
+                    storage.upsertHistoryEventByRequestId(updated)
+                    onNotifyWatch(
+                        sourceNodeId ?: existing.sourceNodeId,
+                        requestId,
+                        RealLocationAlertGateway.ACK_ERROR_SMS_FAILED,
+                        updated.smsStatusNote
+                    )
+                    updated
+                }
+            }
+
+            AndroidPhoneSmsSender.ACTION_SMS_DELIVERED -> {
+                if (resultCode == Activity.RESULT_OK) {
+                    val updated = existing.copy(
+                        status = AlertStatus.DELIVERED,
+                        smsStatusNote = "SMS entregado al destinatario ($contactName)."
+                    )
+                    storage.upsertHistoryEventByRequestId(updated)
+                    onNotifyWatch(
+                        sourceNodeId ?: existing.sourceNodeId,
+                        requestId,
+                        RealLocationAlertGateway.ACK_SMS_DELIVERED,
+                        updated.smsStatusNote
+                    )
+                    updated
+                } else {
+                    // Sin confirmación positiva de entrega: mantener el estado previo sin marcar como entregado
+                    existing
+                }
+            }
+
+            else -> existing
+        }
+    }
+
+    fun mapSmsErrorCode(code: Int): String {
+        return when (code) {
+            SmsManager.RESULT_ERROR_GENERIC_FAILURE -> "Fallo genérico de red o saldo"
+            SmsManager.RESULT_ERROR_NO_SERVICE -> "Sin servicio móvil / sin señal"
+            SmsManager.RESULT_ERROR_NULL_PDU -> "PDU nulo"
+            SmsManager.RESULT_ERROR_RADIO_OFF -> "Radio móvil apagada / Modo avión"
+            else -> "Código $code"
+        }
+    }
+}
+
+/**
  * Recibe el resultado real de `SmsManager` (`ACTION_SMS_SENT` y `ACTION_SMS_DELIVERED`)
  * para no marcar nunca un SMS como enviado o entregado antes de que el sistema lo confirme.
  */
@@ -206,70 +299,23 @@ class SmsStatusBroadcastReceiver : BroadcastReceiver() {
         val contactName = intent.getStringExtra(AndroidPhoneSmsSender.EXTRA_CONTACT_NAME).orEmpty()
 
         val storage = SharedPrefsAlertStorage(context.applicationContext)
-        val existing = storage.loadHistory().firstOrNull { it.requestId == requestId } ?: return
-
-        when (action) {
-            AndroidPhoneSmsSender.ACTION_SMS_SENT -> {
-                if (resultCode == Activity.RESULT_OK) {
-                    // Si ya fue marcado como DELIVERED por un callback rápido, no degradarlo
-                    if (existing.status == AlertStatus.DELIVERED) return
-
-                    val updated = existing.copy(
-                        status = AlertStatus.SENT_BY_DEVICE,
-                        smsStatusNote = "SMS enviado por el dispositivo a $contactName (entrega sin confirmar por el operador)."
-                    )
-                    storage.upsertHistoryEventByRequestId(updated)
-                    notifyWatchAsync(
-                        context = context.applicationContext,
-                        nodeId = sourceNodeId ?: existing.sourceNodeId,
-                        requestId = requestId,
-                        ackStatus = RealLocationAlertGateway.ACK_SMS_SENT_BY_DEVICE,
-                        detail = updated.smsStatusNote
-                    )
-                } else {
-                    val errorReason = mapSmsErrorCode(resultCode)
-                    val updated = existing.copy(
-                        status = AlertStatus.ERROR,
-                        smsStatusNote = "Error al enviar SMS ($errorReason)."
-                    )
-                    storage.upsertHistoryEventByRequestId(updated)
-                    notifyWatchAsync(
-                        context = context.applicationContext,
-                        nodeId = sourceNodeId ?: existing.sourceNodeId,
-                        requestId = requestId,
-                        ackStatus = RealLocationAlertGateway.ACK_ERROR_SMS_FAILED,
-                        detail = updated.smsStatusNote
-                    )
-                }
+        SmsDeliveryResultProcessor.handleBroadcastResult(
+            storage = storage,
+            action = action,
+            resultCode = resultCode,
+            requestId = requestId,
+            sourceNodeId = sourceNodeId,
+            contactName = contactName,
+            onNotifyWatch = { nodeId, reqId, ackStatus, detail ->
+                notifyWatchAsync(
+                    context = context.applicationContext,
+                    nodeId = nodeId,
+                    requestId = reqId,
+                    ackStatus = ackStatus,
+                    detail = detail
+                )
             }
-
-            AndroidPhoneSmsSender.ACTION_SMS_DELIVERED -> {
-                if (resultCode == Activity.RESULT_OK) {
-                    val updated = existing.copy(
-                        status = AlertStatus.DELIVERED,
-                        smsStatusNote = "SMS entregado al destinatario ($contactName)."
-                    )
-                    storage.upsertHistoryEventByRequestId(updated)
-                    notifyWatchAsync(
-                        context = context.applicationContext,
-                        nodeId = sourceNodeId ?: existing.sourceNodeId,
-                        requestId = requestId,
-                        ackStatus = RealLocationAlertGateway.ACK_SMS_DELIVERED,
-                        detail = updated.smsStatusNote
-                    )
-                }
-            }
-        }
-    }
-
-    private fun mapSmsErrorCode(code: Int): String {
-        return when (code) {
-            SmsManager.RESULT_ERROR_GENERIC_FAILURE -> "Fallo genérico de red o saldo"
-            SmsManager.RESULT_ERROR_NO_SERVICE -> "Sin servicio móvil / sin señal"
-            SmsManager.RESULT_ERROR_NULL_PDU -> "PDU nulo"
-            SmsManager.RESULT_ERROR_RADIO_OFF -> "Radio móvil apagada / Modo avión"
-            else -> "Código $code"
-        }
+        )
     }
 
     private fun notifyWatchAsync(

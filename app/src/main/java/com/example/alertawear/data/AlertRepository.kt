@@ -134,9 +134,12 @@ interface LocalAlertStorage {
     fun findEventByRequestId(requestId: String): AlertHistoryEvent?
 }
 
-class SharedPrefsAlertStorage(context: Context) : LocalAlertStorage {
+class SharedPrefsAlertStorage(
+    context: Context,
+    prefsName: String = PREFS_NAME
+) : LocalAlertStorage {
     private val prefs: SharedPreferences =
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
 
     override fun loadContact(): TrustedContact? {
         val name = prefs.getString(KEY_CONTACT_NAME, null) ?: return null
@@ -273,6 +276,11 @@ object AlertEventBus {
 
     fun notifyHistoryUpdated(allEvents: List<AlertHistoryEvent>, latest: AlertHistoryEvent) {
         _latestIncomingEvent.value = latest
+    }
+
+    fun resetForTesting() {
+        _latestIncomingEvent.value = null
+        _isUiInForeground.value = false
     }
 }
 

@@ -97,7 +97,11 @@ class PhoneSosRequestProcessor(
             val existingAck = when (existing.status) {
                 AlertStatus.DELIVERED -> RealLocationAlertGateway.ACK_SMS_DELIVERED
                 AlertStatus.SENT_BY_DEVICE -> RealLocationAlertGateway.ACK_SMS_SENT_BY_DEVICE
-                else -> RealLocationAlertGateway.ACK_SENDING_SMS_WITH_LOCATION
+                else -> if (existing.locationNote.startsWith("Ubicación preparada:")) {
+                    RealLocationAlertGateway.ACK_SENDING_SMS_WITH_LOCATION
+                } else {
+                    RealLocationAlertGateway.ACK_SENDING_SMS_NO_LOCATION
+                }
             }
             ackSender(sourceNodeId, requestId, existingAck, existing.smsStatusNote.ifBlank { existing.locationNote })
             return existing
