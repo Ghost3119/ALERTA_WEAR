@@ -73,10 +73,16 @@ Proyecto académico para la materia **Desarrollo de Dispositivos Inteligentes**.
 
 ## 3. Cómo abrir y compilar el proyecto en Android Studio
 
-1. Abre **Android Studio** y selecciona **Open**.
-2. Elige la carpeta raíz del repositorio (`ALERTAWEAR`).
-3. Espera a que termine la sincronización de **Gradle** (*Gradle Sync*).
-4. Para compilar ambos módulos desde el menú de Android Studio, selecciona **Build > Make Project**, o bien ejecuta en la terminal integrada (PowerShell / CMD en Windows):
+1. Clona el repositorio (si aún no lo tienes localmente):
+
+```powershell
+git clone https://github.com/Ghost3119/ALERTA_WEAR.git
+```
+
+2. Abre **Android Studio** y selecciona **Open**.
+3. Elige la carpeta raíz del repositorio (`ALERTA_WEAR`).
+4. Espera a que termine la sincronización de **Gradle** (*Gradle Sync*).
+5. Para compilar ambos módulos desde el menú de Android Studio, selecciona **Build > Make Project**, o bien ejecuta en la terminal integrada (PowerShell / CMD en Windows):
 
 ```powershell
 .\gradlew.bat :app:assembleDebug :wear:assembleDebug
@@ -188,7 +194,7 @@ Antes de realizar una prueba real de envío de SMS en un teléfono con tarjeta S
 
 ## 10. Cómo ejecutar las pruebas automatizadas desde Windows
 
-Desde PowerShell o símbolo del sistema en la raíz del proyecto (`c:\...\ALERTAWEAR`), ejecuta:
+Desde PowerShell o símbolo del sistema en la raíz del proyecto (`c:\...\ALERTA_WEAR`), ejecuta:
 
 ```powershell
 # Compilar ambos módulos y ejecutar todas las pruebas unitarias (:app y :wear)
