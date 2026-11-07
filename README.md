@@ -20,7 +20,7 @@ Proyecto académico para la materia **Desarrollo de Dispositivos Inteligentes**.
 ### Aplicación móvil Android (`:app`)
 - **Gestión local del contacto de confianza:** Permite guardar y actualizar nombre y número telefónico en almacenamiento local (`SharedPreferences`).
 - **Recepción de solicitudes SOS:** Escucha mensajes provenientes del reloj mediante `PhoneWearableListenerService` (`WearableListenerService`), tanto con la aplicación abierta como mediante notificación de alta prioridad si la interfaz no está en primer plano.
-- **Obtención de ubicación:** Consulta `FusedLocationProviderClient` (última ubicación conocida reciente o lectura rápida de alta precisión con límite de tiempo) y construye un enlace directo a Google Maps (`https://maps.google.com/?q=LATITUD,LONGITUD`). Si el permiso fue denegado o el GPS está desactivado, continúa con el envío del SMS indicando claramente que la ubicación no está disponible.
+- **Obtención de ubicación y validación de frescura (`LocationFreshness`):** Consulta `FusedLocationProviderClient` evaluando múltiples fuentes en orden (alta precisión con `getCurrentLocation`, última ubicación conocida `lastLocation`, y respaldo balanceado con `getCurrentLocation`). Cada lectura se convierte a `LocationFix` y se valida estrictamente mediante `LocationFreshness` (rechazando coordenadas con más de 2 minutos / 120,000 ms de antigüedad o con edad negativa según `SystemClock.elapsedRealtimeNanos() - location.elapsedRealtimeNanos`). Si ninguna fuente provee una ubicación reciente, se retorna un resultado `TIMEOUT` ("no se obtuvo una ubicación reciente") y la alerta continúa: el SMS se envía sin enlace de Maps y con la leyenda `"Ubicación no disponible"`.
 - **Envío de SMS y distinción estricta de estados:** Utiliza `SmsManager` junto con `PendingIntent`s (`ACTION_SMS_SENT` y `ACTION_SMS_DELIVERED`) procesados por `SmsStatusBroadcastReceiver`:
   - Nunca marca un SMS como enviado solo por haber iniciado el proceso.
   - Distingue **Enviando SMS** (`SENDING_SMS`), **Enviado por el dispositivo (entrega sin confirmar)** (`SENT_BY_DEVICE`) y **Entregado** (`DELIVERED`, solo si la red celular devuelve confirmación de entrega).
@@ -201,7 +201,7 @@ Desde PowerShell o símbolo del sistema en la raíz del proyecto (`c:\...\ALERTA
 .\gradlew.bat :app:assembleDebug :wear:assembleDebug :app:testDebugUnitTest :wear:testDebugUnitTest
 ```
 
-Las pruebas unitarias (`MobileAlertViewModelTest` y `WearAlertViewModelTest`) utilizan dobles de prueba (`FakePhoneSmsSender`, `FakeLocationProvider`, `FakeWearPhoneBridge`, `InMemoryAlertStorage`), por lo que **nunca envían SMS reales** ni modifican datos reales al ejecutarse.
+Las pruebas unitarias (`LocationFreshnessTest`, `MobileAlertViewModelTest` y `WearAlertViewModelTest`) utilizan dobles de prueba (`FakePhoneSmsSender`, `FakeLocationProvider`, `FakeWearPhoneBridge`, `InMemoryAlertStorage`), por lo que **nunca envían SMS reales** ni modifican datos reales al ejecutarse.
 
 - Reporte HTML de `:app`: `app\build\reports\tests\testDebugUnitTest\index.html`
 - Reporte HTML de `:wear`: `wear\build\reports\tests\testDebugUnitTest\index.html`
