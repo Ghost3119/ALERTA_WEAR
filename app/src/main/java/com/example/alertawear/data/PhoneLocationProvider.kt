@@ -3,7 +3,9 @@ package com.example.alertawear.data
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.location.Location
 import android.location.LocationManager
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import com.example.alertawear.model.LocationOutcomeStatus
 import com.example.alertawear.model.LocationResult
@@ -14,7 +16,6 @@ import com.google.android.gms.tasks.CancellationTokenSource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeoutOrNull
-import java.util.Locale
 
 interface PhoneLocationProvider {
     fun hasForegroundLocationPermission(): Boolean
@@ -53,6 +54,16 @@ class FusedPhoneLocationProvider(
             locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
     }
 
+    private fun Location.toLocationFix(): LocationFix {
+        val ageMs = (SystemClock.elapsedRealtimeNanos() - this.elapsedRealtimeNanos) / 1_000_000L
+        return LocationFix(
+            latitude = this.latitude,
+            longitude = this.longitude,
+            accuracyMeters = this.accuracy,
+            ageMs = ageMs
+        )
+    }
+
     @Suppress("MissingPermission")
     override suspend fun obtainLocation(isAppInForeground: Boolean): LocationResult {
         if (!hasForegroundLocationPermission()) {
@@ -80,49 +91,38 @@ class FusedPhoneLocationProvider(
         val cancellationTokenSource = CancellationTokenSource()
 
         return try {
-            // 1. Intentar primero obtener una ubicación fresca de alta precisión
             val highAccRequest = CurrentLocationRequest.Builder()
                 .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
                 .setDurationMillis(timeoutMs)
                 .setMaxUpdateAgeMillis(120_000L)
                 .build()
 
-            val freshLocation = runCatching {
-                withTimeoutOrNull(timeoutMs) {
+            val source1: suspend () -> LocationFix? = {
+                val loc = withTimeoutOrNull(timeoutMs) {
                     fusedClient.getCurrentLocation(highAccRequest, cancellationTokenSource.token).await()
                 }
-            }.getOrNull()
-
-            // 2. Respaldo en interiores (Wi-Fi / Celda) o última ubicación conocida del dispositivo
-            val fallbackToken = CancellationTokenSource()
-            val location = freshLocation
-                ?: runCatching { fusedClient.lastLocation.await() }.getOrNull()
-                ?: runCatching {
-                    val balancedReq = CurrentLocationRequest.Builder()
-                        .setPriority(Priority.PRIORITY_BALANCED_POWER_ACCURACY)
-                        .setDurationMillis(3000L)
-                        .build()
-                    withTimeoutOrNull(3200L) {
-                        fusedClient.getCurrentLocation(balancedReq, fallbackToken.token).await()
-                    }
-                }.getOrNull()
-
-            if (location != null) {
-                val latFormatted = String.format(Locale.US, "%.5f", location.latitude)
-                val lonFormatted = String.format(Locale.US, "%.5f", location.longitude)
-                LocationResult(
-                    status = LocationOutcomeStatus.ACQUIRED,
-                    latitude = location.latitude,
-                    longitude = location.longitude,
-                    accuracyMeters = location.accuracy,
-                    detailText = "Ubicación preparada: $latFormatted, $lonFormatted"
-                )
-            } else {
-                LocationResult(
-                    status = LocationOutcomeStatus.TIMEOUT,
-                    detailText = "Tiempo de espera agotado al buscar señal de ubicación."
-                )
+                loc?.toLocationFix()
             }
+
+            val source2: suspend () -> LocationFix? = {
+                val loc = fusedClient.lastLocation.await()
+                loc?.toLocationFix()
+            }
+
+            val source3: suspend () -> LocationFix? = {
+                val fallbackToken = CancellationTokenSource()
+                val balancedReq = CurrentLocationRequest.Builder()
+                    .setPriority(Priority.PRIORITY_BALANCED_POWER_ACCURACY)
+                    .setDurationMillis(3000L)
+                    .build()
+                val loc = withTimeoutOrNull(3200L) {
+                    fusedClient.getCurrentLocation(balancedReq, fallbackToken.token).await()
+                }
+                loc?.toLocationFix()
+            }
+
+            val bestFix = LocationFreshness.firstRecent(source1, source2, source3)
+            LocationFreshness.toResult(bestFix)
         } catch (e: SecurityException) {
             LocationResult(
                 status = LocationOutcomeStatus.PERMISSION_DENIED,
