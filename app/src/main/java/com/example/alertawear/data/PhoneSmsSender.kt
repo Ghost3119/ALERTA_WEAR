@@ -125,9 +125,14 @@ class AndroidPhoneSmsSender(
                 )
             }
 
-            val parts = smsManager.divideMessage(messageBody)
-            val sentIntents = ArrayList<PendingIntent>(parts.size)
-            val deliveryIntents = ArrayList<PendingIntent>(parts.size)
+            val dividedParts = smsManager.divideMessage(messageBody)
+            val parts = if (dividedParts.isNullOrEmpty()) arrayListOf(messageBody) else dividedParts
+            val totalParts = parts.size
+
+            SmsDeliveryResultProcessor.registerExpectedParts(requestId, totalParts)
+
+            val sentIntents = ArrayList<PendingIntent>(totalParts)
+            val deliveryIntents = ArrayList<PendingIntent>(totalParts)
 
             for (index in parts.indices) {
                 val sentIntent = Intent(context, SmsStatusBroadcastReceiver::class.java).apply {
@@ -135,6 +140,8 @@ class AndroidPhoneSmsSender(
                     putExtra(EXTRA_REQUEST_ID, requestId)
                     putExtra(EXTRA_SOURCE_NODE_ID, sourceNodeId)
                     putExtra(EXTRA_CONTACT_NAME, contact.name)
+                    putExtra(EXTRA_PART_INDEX, index)
+                    putExtra(EXTRA_TOTAL_PARTS, totalParts)
                 }
                 val sentPi = PendingIntent.getBroadcast(
                     context,
@@ -149,6 +156,8 @@ class AndroidPhoneSmsSender(
                     putExtra(EXTRA_REQUEST_ID, requestId)
                     putExtra(EXTRA_SOURCE_NODE_ID, sourceNodeId)
                     putExtra(EXTRA_CONTACT_NAME, contact.name)
+                    putExtra(EXTRA_PART_INDEX, index)
+                    putExtra(EXTRA_TOTAL_PARTS, totalParts)
                 }
                 val deliveredPi = PendingIntent.getBroadcast(
                     context,
@@ -159,7 +168,7 @@ class AndroidPhoneSmsSender(
                 deliveryIntents.add(deliveredPi)
             }
 
-            if (parts.size > 1) {
+            if (totalParts > 1) {
                 smsManager.sendMultipartTextMessage(
                     contact.phone.trim(),
                     null,
@@ -195,15 +204,49 @@ class AndroidPhoneSmsSender(
         const val EXTRA_REQUEST_ID = "extra_request_id"
         const val EXTRA_SOURCE_NODE_ID = "extra_source_node_id"
         const val EXTRA_CONTACT_NAME = "extra_contact_name"
+        const val EXTRA_PART_INDEX = "extra_part_index"
+        const val EXTRA_TOTAL_PARTS = "extra_total_parts"
     }
 }
 
 /**
- * Procesa el resultado de los callbacks de `SmsManager` (`ACTION_SMS_SENT` y `ACTION_SMS_DELIVERED`),
- * separando estrictamente "Enviado por el dispositivo (entrega sin confirmar)" (`SENT_BY_DEVICE`)
- * de "Entregado" (`DELIVERED`).
+ * Procesa el resultado de los callbacks de `SmsManager` (`ACTION_SMS_SENT` y `ACTION_SMS_DELIVERED`)
+ * soportando mensajes divididos en múltiples partes (multipart SMS):
+ * - Solo confirma `SENT_BY_DEVICE` o `DELIVERED` cuando se completan todas las partes esperadas.
+ * - Conserva cualquier error ocurrido en alguna de las partes sin sobreescribirlo con partes exitosas.
+ * - Controla respuestas duplicadas o fuera de orden por índice de parte.
  */
 object SmsDeliveryResultProcessor {
+
+    private data class MultipartTrackingState(
+        var totalParts: Int,
+        val sentOkParts: MutableSet<Int> = mutableSetOf(),
+        val sentFailedParts: MutableMap<Int, Int> = mutableMapOf(),
+        val deliveredOkParts: MutableSet<Int> = mutableSetOf(),
+        val deliveredFailedParts: MutableSet<Int> = mutableSetOf(),
+        var sentCompleteNotified: Boolean = false,
+        var deliveredCompleteNotified: Boolean = false,
+        var errorNotified: Boolean = false
+    )
+
+    private val lock = Any()
+    private val multipartStates = mutableMapOf<String, MultipartTrackingState>()
+
+    fun registerExpectedParts(requestId: String, totalParts: Int) {
+        val safeTotal = totalParts.coerceAtLeast(1)
+        synchronized(lock) {
+            val state = multipartStates.getOrPut(requestId) { MultipartTrackingState(safeTotal) }
+            if (safeTotal > state.totalParts) {
+                state.totalParts = safeTotal
+            }
+        }
+    }
+
+    fun resetForTesting() {
+        synchronized(lock) {
+            multipartStates.clear()
+        }
+    }
 
     fun handleBroadcastResult(
         storage: LocalAlertStorage,
@@ -212,66 +255,135 @@ object SmsDeliveryResultProcessor {
         requestId: String,
         sourceNodeId: String?,
         contactName: String,
+        partIndex: Int = 0,
+        totalParts: Int = 1,
         onNotifyWatch: (nodeId: String?, requestId: String, ackStatus: String, detail: String) -> Unit
     ): AlertHistoryEvent? {
-        val existing = storage.findEventByRequestId(requestId) ?: return null
-
-        return when (action) {
-            AndroidPhoneSmsSender.ACTION_SMS_SENT -> {
-                if (resultCode == Activity.RESULT_OK) {
-                    // Si ya fue marcado como DELIVERED por un callback previo, no degradarlo
-                    if (existing.status == AlertStatus.DELIVERED) return existing
-
-                    val updated = existing.copy(
-                        status = AlertStatus.SENT_BY_DEVICE,
-                        smsStatusNote = "SMS enviado por el dispositivo a $contactName (entrega sin confirmar por el operador)."
-                    )
-                    storage.upsertHistoryEventByRequestId(updated)
-                    onNotifyWatch(
-                        sourceNodeId ?: existing.sourceNodeId,
-                        requestId,
-                        RealLocationAlertGateway.ACK_SMS_SENT_BY_DEVICE,
-                        updated.smsStatusNote
-                    )
-                    updated
-                } else {
-                    val errorReason = mapSmsErrorCode(resultCode)
-                    val updated = existing.copy(
-                        status = AlertStatus.ERROR,
-                        smsStatusNote = "Error al enviar SMS ($errorReason)."
-                    )
-                    storage.upsertHistoryEventByRequestId(updated)
-                    onNotifyWatch(
-                        sourceNodeId ?: existing.sourceNodeId,
-                        requestId,
-                        RealLocationAlertGateway.ACK_ERROR_SMS_FAILED,
-                        updated.smsStatusNote
-                    )
-                    updated
-                }
+        synchronized(lock) {
+            val existing = storage.findEventByRequestId(requestId) ?: return null
+            val safeTotal = totalParts.coerceAtLeast(1)
+            val state = multipartStates.getOrPut(requestId) { MultipartTrackingState(safeTotal) }
+            if (safeTotal > state.totalParts) {
+                state.totalParts = safeTotal
             }
 
-            AndroidPhoneSmsSender.ACTION_SMS_DELIVERED -> {
-                if (resultCode == Activity.RESULT_OK) {
-                    val updated = existing.copy(
-                        status = AlertStatus.DELIVERED,
-                        smsStatusNote = "SMS entregado al destinatario ($contactName)."
-                    )
-                    storage.upsertHistoryEventByRequestId(updated)
-                    onNotifyWatch(
-                        sourceNodeId ?: existing.sourceNodeId,
-                        requestId,
-                        RealLocationAlertGateway.ACK_SMS_DELIVERED,
-                        updated.smsStatusNote
-                    )
-                    updated
-                } else {
-                    // Sin confirmación positiva de entrega: mantener el estado previo sin marcar como entregado
-                    existing
-                }
+            if (partIndex !in 0 until state.totalParts) {
+                return existing
             }
 
-            else -> existing
+            return when (action) {
+                AndroidPhoneSmsSender.ACTION_SMS_SENT -> {
+                    // Ignorar respuestas duplicadas para la misma parte
+                    if (partIndex in state.sentOkParts || partIndex in state.sentFailedParts) {
+                        return existing
+                    }
+
+                    if (resultCode == Activity.RESULT_OK) {
+                        state.sentOkParts.add(partIndex)
+
+                        // Si alguna otra parte ya falló antes, conservar el estado de ERROR
+                        if (state.sentFailedParts.isNotEmpty() || existing.status == AlertStatus.ERROR) {
+                            return existing
+                        }
+
+                        // Si aún faltan partes por enviar, mantener en progreso sin confirmar envío completo
+                        if (state.sentOkParts.size < state.totalParts) {
+                            return existing
+                        }
+
+                        // Todas las partes enviadas: si ya estaba en DELIVERED (llegó fuera de orden), no degradar
+                        if (existing.status == AlertStatus.DELIVERED || state.deliveredCompleteNotified) {
+                            state.sentCompleteNotified = true
+                            return existing
+                        }
+
+                        if (state.sentCompleteNotified) {
+                            return existing
+                        }
+                        state.sentCompleteNotified = true
+
+                        val updated = existing.copy(
+                            status = AlertStatus.SENT_BY_DEVICE,
+                            smsStatusNote = "SMS enviado por el dispositivo a $contactName (entrega sin confirmar por el operador)."
+                        )
+                        storage.upsertHistoryEventByRequestId(updated)
+                        onNotifyWatch(
+                            sourceNodeId ?: existing.sourceNodeId,
+                            requestId,
+                            RealLocationAlertGateway.ACK_SMS_SENT_BY_DEVICE,
+                            updated.smsStatusNote
+                        )
+                        updated
+                    } else {
+                        state.sentFailedParts[partIndex] = resultCode
+                        val errorReason = mapSmsErrorCode(resultCode)
+                        val note = if (state.totalParts > 1) {
+                            "Error al enviar SMS ($errorReason) en parte ${partIndex + 1} de ${state.totalParts}."
+                        } else {
+                            "Error al enviar SMS ($errorReason)."
+                        }
+                        val updated = existing.copy(
+                            status = AlertStatus.ERROR,
+                            smsStatusNote = note
+                        )
+                        storage.upsertHistoryEventByRequestId(updated)
+                        if (!state.errorNotified) {
+                            state.errorNotified = true
+                            onNotifyWatch(
+                                sourceNodeId ?: existing.sourceNodeId,
+                                requestId,
+                                RealLocationAlertGateway.ACK_ERROR_SMS_FAILED,
+                                updated.smsStatusNote
+                            )
+                        }
+                        updated
+                    }
+                }
+
+                AndroidPhoneSmsSender.ACTION_SMS_DELIVERED -> {
+                    // Si alguna parte falló en el envío, conservar el error sin marcar como entregado
+                    if (state.sentFailedParts.isNotEmpty() || existing.status == AlertStatus.ERROR) {
+                        return existing
+                    }
+
+                    if (resultCode == Activity.RESULT_OK) {
+                        // Ignorar confirmaciones de entrega duplicadas de la misma parte
+                        if (partIndex in state.deliveredOkParts) {
+                            return existing
+                        }
+                        state.deliveredOkParts.add(partIndex)
+
+                        // Solo confirmar entrega cuando todas las partes fueron entregadas sin fallos
+                        if (state.deliveredFailedParts.isNotEmpty() || state.deliveredOkParts.size < state.totalParts) {
+                            return existing
+                        }
+
+                        if (state.deliveredCompleteNotified) {
+                            return existing
+                        }
+                        state.deliveredCompleteNotified = true
+
+                        val updated = existing.copy(
+                            status = AlertStatus.DELIVERED,
+                            smsStatusNote = "SMS entregado al destinatario ($contactName)."
+                        )
+                        storage.upsertHistoryEventByRequestId(updated)
+                        onNotifyWatch(
+                            sourceNodeId ?: existing.sourceNodeId,
+                            requestId,
+                            RealLocationAlertGateway.ACK_SMS_DELIVERED,
+                            updated.smsStatusNote
+                        )
+                        updated
+                    } else {
+                        // Sin confirmación positiva de entrega en esta parte: registrar fallo de entrega y mantener estado previo
+                        state.deliveredFailedParts.add(partIndex)
+                        existing
+                    }
+                }
+
+                else -> existing
+            }
         }
     }
 
@@ -297,6 +409,8 @@ class SmsStatusBroadcastReceiver : BroadcastReceiver() {
         val requestId = intent.getStringExtra(AndroidPhoneSmsSender.EXTRA_REQUEST_ID) ?: return
         val sourceNodeId = intent.getStringExtra(AndroidPhoneSmsSender.EXTRA_SOURCE_NODE_ID)
         val contactName = intent.getStringExtra(AndroidPhoneSmsSender.EXTRA_CONTACT_NAME).orEmpty()
+        val partIndex = intent.getIntExtra(AndroidPhoneSmsSender.EXTRA_PART_INDEX, 0)
+        val totalParts = intent.getIntExtra(AndroidPhoneSmsSender.EXTRA_TOTAL_PARTS, 1)
 
         val storage = SharedPrefsAlertStorage(context.applicationContext)
         SmsDeliveryResultProcessor.handleBroadcastResult(
@@ -306,6 +420,8 @@ class SmsStatusBroadcastReceiver : BroadcastReceiver() {
             requestId = requestId,
             sourceNodeId = sourceNodeId,
             contactName = contactName,
+            partIndex = partIndex,
+            totalParts = totalParts,
             onNotifyWatch = { nodeId, reqId, ackStatus, detail ->
                 notifyWatchAsync(
                     context = context.applicationContext,
